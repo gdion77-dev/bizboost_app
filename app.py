@@ -5,7 +5,7 @@
 # - PDF export με DejaVuSans (σωστά Ελληνικά), logo και πίνακες
 # - Ανά οφειλή πρόβλεψη (δόση, διαγραφή, υπόλοιπο προς ρύθμιση, %)
 # - Αποθήκευση προβλέψεων και "πραγματικών ρυθμίσεων" ανά οφειλή (real_debts_json)
-# - ML fallback όταν δεν υπάρχει εκπαιδευμένο μοντέλο
+# - ML (XGBoost μέσω Pipeline) με ασφαλές fallback όταν δεν έχει εκπαιδευτεί/εγκατασταθεί
 
 import os, io, json, uuid, datetime as dt
 import numpy as np
@@ -14,18 +14,18 @@ import streamlit as st
 
 from sqlalchemy import create_engine, text
 
-# ── ML: προσπάθησε να φορτώσεις XGBoost, αλλιώς fallback κανόνας
+# ── Προσπάθεια φόρτωσης XGBoost (ασφαλές fallback αν λείπει) ──
+XGB_AVAILABLE = True
 try:
     from xgboost import XGBRegressor
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_absolute_error
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
-    XGB_AVAILABLE = True
 except Exception:
     XGB_AVAILABLE = False
 
-# ── PDF
+# PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -35,28 +35,25 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-# ────────────────────────────── PATHS / UI ──────────────────────────────
+# ────────────────────────────── ΡΥΘΜΙΣΕΙΣ UI / PATHS ──────────────────────────────
 st.set_page_config(page_title="Bizboost - Πρόβλεψη Ρυθμίσεων", page_icon="💠", layout="wide")
 
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
 FONT_PATH = os.path.join(BASE_DIR, "assets", "fonts", "DejaVuSans.ttf")
 DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")  # προαιρετικό αρχικό import
 
 # Γραμματοσειρά για Ελληνικά στο PDF
-def _pick_pdf_font():
+try:
     if os.path.exists(FONT_PATH):
-        try:
-            pdfmetrics.registerFont(TTFont("DejaVuSans", FONT_PATH))
-            return "DejaVuSans"
-        except Exception as e:
-            st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF ({FONT_PATH}): {e}")
-            return "Helvetica"
+        pdfmetrics.registerFont(TTFont("DejaVuSans", FONT_PATH))
+        PDF_FONT = "DejaVuSans"
     else:
         st.warning("Λείπει η γραμματοσειρά PDF: assets/fonts/DejaVuSans.ttf (για σωστά Ελληνικά).")
-        return "Helvetica"
-
-PDF_FONT = _pick_pdf_font()
+        PDF_FONT = "Helvetica"
+except Exception as e:
+    st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF: {e}")
+    PDF_FONT = "Helvetica"
 
 # ────────────────────────────── ΣΤΑΘΕΡΕΣ ──────────────────────────────
 CREDITORS = [
@@ -120,14 +117,14 @@ def get_db_engine():
     if not db_url:
         st.error("Δεν έχει οριστεί DATABASE_URL στα Secrets.")
         st.stop()
-    # psycopg v3 driver string για SQLAlchemy
+    # psycopg v3 driver string
     if db_url.startswith("postgresql://"):
         db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
     engine = create_engine(db_url, pool_pre_ping=True)
     return engine
 
 def init_db(engine):
-    """Δημιουργία/αναβάθμιση σχήματος cases (με real_debts_json)."""
+    """Δημιουργία/αναβάθμιση σχήματος cases, συμπεριλαμβανομένου του real_debts_json."""
     ddl = """
     CREATE TABLE IF NOT EXISTS cases (
       case_id TEXT PRIMARY KEY,
@@ -162,8 +159,11 @@ def init_db(engine):
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
-        # αν λείπει real_debts_json σε παλιό πίνακα, πρόσθεσέ τη
-        conn.execute(text("ALTER TABLE cases ADD COLUMN IF NOT EXISTS real_debts_json JSONB DEFAULT '[]';"))
+        # Αν λείπει η στήλη real_debts_json σε παλαιό πίνακα, πρόσθεσέ την
+        try:
+            conn.execute(text("ALTER TABLE cases ADD COLUMN IF NOT EXISTS real_debts_json JSONB DEFAULT '[]';"))
+        except Exception:
+            pass
 
 def load_data_db()->pd.DataFrame:
     engine = get_db_engine()
@@ -214,6 +214,7 @@ def csv_to_db_once_if_empty():
     if cnt == 0 and os.path.exists(DATA_CSV):
         try:
             dfcsv = pd.read_csv(DATA_CSV)
+            # καθάρισε NaN σε JSON στήλες (αν υπάρχουν)
             for c in ["debts_json","co_debtors_json","real_debts_json"]:
                 if c in dfcsv.columns:
                     dfcsv[c] = dfcsv[c].fillna("[]")
@@ -230,9 +231,11 @@ def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 
 # ─────────────────────────────── ML ───────────────────────────────
+@st.cache_resource(show_spinner=False)
 def get_model():
     if not XGB_AVAILABLE:
         return None
+    # Pipeline: StandardScaler + XGBRegressor (γρήγορο/αποδοτικό)
     return Pipeline(steps=[
         ("scaler", StandardScaler(with_mean=False)),
         ("xgb", XGBRegressor(
@@ -263,18 +266,10 @@ def build_features_row(total_income, edd_household, extras_sum, total_debt, secu
     }])
     return x
 
-def safe_predict(model, Xd, fallback_value):
-    if model is None:
-        return fallback_value
-    try:
-        return float(model.predict(Xd)[0])
-    except Exception:
-        return fallback_value
-
 def predict_single_debt_monthly(model, monthly_income, edd_val, extras_sum,
                                 debt_balance, debt_secured_amt, property_value,
                                 annual_rate_pct, age_cap_months, creditor_name):
-    """Υπολογίζει (pred_monthly, writeoff €, residual €, haircut %, term_cap) για μία οφειλή."""
+    """Υπολογίζει (pred_monthly, pred_writeoff €, pred_residual €, haircut %, term_cap) για μία οφειλή."""
     term_cap = term_cap_for_single_debt(creditor_name, age_cap_months)
 
     Xd = build_features_row(
@@ -288,11 +283,18 @@ def predict_single_debt_monthly(model, monthly_income, edd_val, extras_sum,
         term_cap=term_cap
     )
 
-    # Fallback: 70% του διαθέσιμου
-    avail = max(0.0, monthly_income - edd_val - extras_sum)
-    pred = safe_predict(model, Xd, fallback_value=max(0.0, round(avail * 0.7, 2)))
+    # Ασφαλές predict (fallback αν το pipeline δεν έχει εκπαιδευτεί ή δεν υπάρχει XGB)
+    pred = None
+    if model is not None:
+        try:
+            pred = float(model.predict(Xd)[0])
+        except Exception:
+            pred = None
+    if pred is None:
+        avail = max(0.0, monthly_income - edd_val - extras_sum)
+        pred = max(0.0, round(avail * 0.7, 2))
 
-    # Διαγραφή / Υπόλοιπο / % κουρέματος
+    # Παράγωγα: διαγραφή/υπόλοιπο προς ρύθμιση
     expected_total_repay = pred * term_cap
     writeoff = max(0.0, float(debt_balance) - expected_total_repay)
     residual = max(0.0, float(debt_balance) - writeoff)
@@ -304,11 +306,9 @@ def train_if_labels(df: pd.DataFrame):
     """Εκπαίδευση μοντέλου αν υπάρχουν πραγματικές ρυθμίσεις (real_monthly)."""
     if not XGB_AVAILABLE:
         return None, None
-
     labeled = df.dropna(subset=["real_monthly"])
     if labeled.empty:
         return None, None
-
     X = []
     y = []
     for _, r in labeled.iterrows():
@@ -347,11 +347,9 @@ def train_if_labels(df: pd.DataFrame):
 def make_pdf(case_dict:dict)->bytes:
     """Επαγγελματικό PDF με Ελληνικά, logo, πίνακες, αιτιολόγηση."""
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=1.8*cm, bottomMargin=1.8*cm
-    )
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=1.8*cm, bottomMargin=1.8*cm)
 
     styles = getSampleStyleSheet()
     base_font = PDF_FONT
@@ -433,13 +431,14 @@ def make_pdf(case_dict:dict)->bytes:
 
     # Σκεπτικό
     reasoning = (
-        "Η πρόταση ανά οφειλή προκύπτει βάσει κανόνων του εξωδικαστικού: "
-        "για απαιτήσεις Δημοσίου (ΑΑΔΕ/ΕΦΚΑ) μέγιστο έως 240 μήνες, "
-        "για τραπεζικά/servicers έως 420 μήνες. Χρησιμοποιείται επιπλέον "
-        "κόφτης βάσει ηλικίας οφειλέτη. Ως διαθέσιμο λαμβάνεται το συνολικό "
-        "μηνιαίο εισόδημα (οφειλέτη + συνοφειλετών) μείον ΕΔΔ (οικογένειας + "
-        "συνοφειλετών) και δηλωθείσες πρόσθετες δαπάνες. Το υπόλοιπο προς ρύθμιση "
-        "ανά οφειλή = Υπόλοιπο οφειλής − Διαγραφή. Ποσοστό κουρέματος = Διαγραφή / Υπόλοιπο οφειλής."
+        "Η πρόταση ανά οφειλή προκύπτει βάσει των κανόνων του εξωδικαστικού: "
+        "για απαιτήσεις Δημοσίου (ΑΑΔΕ/ΕΦΚΑ) ο μέγιστος αριθμός δόσεων λαμβάνεται "
+        "έως 240 μήνες, ενώ για τραπεζικά/servicers έως 420 μήνες. "
+        "Επιπλέον εφαρμόζεται κόφτης βάσει ηλικίας του οφειλέτη. "
+        "Ως διαθέσιμο εισόδημα λαμβάνεται το συνολικό μηνιαίο εισόδημα μειωμένο "
+        "κατά τις Ελάχιστες Δαπάνες Διαβίωσης και τις επιπλέον δηλωθείσες δαπάνες. "
+        "Το υπόλοιπο προς ρύθμιση ανά οφειλή ισούται με: Υπόλοιπο οφειλής − Διαγραφή. "
+        "Το ποσοστό κουρέματος είναι Διαγραφή / Υπόλοιπο οφειλής."
     )
     story.append(Paragraph("Σκεπτικό πρότασης", styles["H2"]))
     story.append(Paragraph(reasoning, styles["P"]))
@@ -471,16 +470,31 @@ if page == "Νέα Πρόβλεψη":
         property_value = col2.number_input("Σύνολο αξίας ακίνητης περιουσίας (€)", 0.0, 1e9, 0.0, step=1000.0)
         annual_rate_pct= col3.number_input("Επιτόκιο ετησίως (%)", 0.0, 30.0, 6.0, step=0.1)
 
-        # Συνοφειλέτες – JSON input (αυτό που ζήτησες)
+        # ── Συνοφειλέτες σε πίνακα (όχι JSON) ──
         st.subheader("Συνοφειλέτες (προαιρετικά)")
-        st.caption(
-            "Λίστα αντικειμένων με: name, annual_income, property_value, age, adults, children.\n"
-            "Παράδειγμα: "
-            "[{'name':'Μαρία','annual_income':12000,'property_value':0,'age':40,'adults':1,'children':1}]"
+        st.caption("Συμπλήρωσε τους συνοφειλέτες σε πίνακα. Τα εισοδήματα είναι ΕΤΗΣΙΑ και θα γίνουν αυτόματα μηνιαία.\n"
+                   "Στήλες: name, annual_income, property_value, age, adults, children.")
+        default_codes = pd.DataFrame([{
+            "name": "",
+            "annual_income": 0.0,
+            "property_value": 0.0,
+            "age": 40,
+            "adults": 1,
+            "children": 0
+        }])
+        codes_df = st.data_editor(
+            default_codes, num_rows="dynamic",
+            column_config={
+                "name": st.column_config.TextColumn("Ονοματεπώνυμο"),
+                "annual_income": st.column_config.NumberColumn("Ετήσιο εισόδημα (€)", step=500.0, format="%.2f"),
+                "property_value": st.column_config.NumberColumn("Ακίνητη περιουσία (€)", step=1000.0, format="%.2f"),
+                "age": st.column_config.NumberColumn("Ηλικία", min_value=18, max_value=99, step=1),
+                "adults": st.column_config.NumberColumn("Ενήλικες στο νοικοκυριό", min_value=1, max_value=6, step=1),
+                "children": st.column_config.NumberColumn("Ανήλικοι στο νοικοκυριό", min_value=0, max_value=6, step=1),
+            },
+            use_container_width=True
         )
-        co_raw = st.text_area("Δώσε JSON (ή άφησε κενό)", "")
 
-        # Επιπλέον δαπάνες
         st.subheader("Επιπλέον Δαπάνες (πέραν ΕΔΔ)")
         c1,c2,c3 = st.columns(3)
         extra_medical = c1.number_input("Ιατρικά (€ / μήνα)", 0.0, 100000.0, 0.0, step=10.0)
@@ -510,8 +524,8 @@ if page == "Νέα Πρόβλεψη":
             use_container_width=True
         )
 
-        # ΕΔΔ (οικογένειας οφειλέτη)
-        st.subheader("Ελάχιστες Δαπάνες Διαβίωσης (νοικοκυριού οφειλέτη)")
+        # ΕΔΔ
+        st.subheader("Ελάχιστες Δαπάνες Διαβίωσης")
         use_manual = st.checkbox("Χειροκίνητη εισαγωγή ΕΔΔ;", value=False)
         if use_manual:
             edd_val = st.number_input("ΕΔΔ νοικοκυριού (€ / μήνα)", 0.0, 10000.0, 800.0, step=10.0)
@@ -522,26 +536,20 @@ if page == "Νέα Πρόβλεψη":
         submitted = st.form_submit_button("Υπολογισμός Πρόβλεψης & Αποθήκευση", use_container_width=True)
 
     if submitted:
-        # Parse συνοφειλέτες
-        try:
-            co_list = json.loads(co_raw) if co_raw.strip() else []
-            if not isinstance(co_list, list): co_list = []
-        except Exception:
-            co_list = []
-            st.warning("Μη έγκυρο JSON στους συνοφειλέτες. Αγνοήθηκε.")
+        # Συνοφειλέτες από τον πίνακα
+        co_list = codes_df.fillna(0).to_dict(orient="records")
 
-        # Εισόδημα/ΕΔΔ συνοφειλετών
+        # Υπολογισμός μηνιαίου διαθέσιμου με συνεκτίμηση συνοφειλετών:
         monthly_income_codes = 0.0
         edd_codes = 0.0
         for c in co_list:
             aincome = float(c.get("annual_income") or 0.0)
-            monthly_income_codes += aincome/12.0
+            monthly_income_codes += aincome / 12.0
             cadults = int(c.get("adults") or 1)
             cchildren = int(c.get("children") or 0)
             edd_codes += compute_edd(cadults, cchildren)
 
-        # Συνολικό μηνιαίο εισόδημα και συνολικά ΕΔΔ
-        monthly_income = (annual_income_main/12.0) + monthly_income_codes
+        monthly_income = monthly_income_main + monthly_income_codes
         edd_total_house = edd_val + edd_codes
 
         # Συγκεντρωτικά για header/PDF
@@ -612,7 +620,7 @@ if page == "Νέα Πρόβλεψη":
             "adults": int(adults),
             "children": int(children),
 
-            # Μηνιαίο εισόδημα (οφειλέτη + συνοφειλέτες)
+            # μηναίο εισόδημα (οφειλέτη + συνοφειλέτες)
             "monthly_income": float(monthly_income),
 
             "property_value": float(property_value),
@@ -637,14 +645,14 @@ if page == "Νέα Πρόβλεψη":
             # Πραγματικές ρυθμίσεις ανα οφειλή (άδειο αρχικά)
             "real_debts_json": json.dumps([], ensure_ascii=False),
 
-            # Δεν κρατάμε συνολικά aggregated προτάσεις σε επίπεδο υπόθεσης
+            # ΔΕΝ κρατάμε συνολικά aggregated προτάσεις σε επίπεδο υπόθεσης
             "term_months": None,
             "predicted_at": now_str,
             "predicted_monthly": None,
             "predicted_haircut_pct": None,
             "prob_accept": None,
 
-            # Roll-up πραγματικής ρύθμισης (αν χρειαστεί στο μέλλον)
+            # Πεδία roll-up πραγματικής ρύθμισης (προαιρετικά/μελλοντικά)
             "real_monthly": None,
             "real_haircut_pct": None,
             "accepted": None,
@@ -679,8 +687,10 @@ if page == "Νέα Πρόβλεψη":
             use_container_width=True
         )
 
-        if XGB_AVAILABLE and (mae is not None):
+        if XGB_AVAILABLE and mae is not None:
             st.caption(f"MAE μοντέλου (εκπαίδευση από ιστορικά): ~{mae:,.2f} €/μήνα")
+        elif not XGB_AVAILABLE:
+            st.caption("⚠️ XGBoost δεν είναι διαθέσιμο σε αυτό το περιβάλλον — γίνεται ασφαλές fallback στον κανόνα 70% του διαθέσιμου.")
 
 # ─────────────────────── ΠΡΟΒΛΕΨΕΙΣ & ΠΡΑΓΜΑΤΙΚΕΣ ΡΥΘΜΙΣΕΙΣ ───────────────────────
 elif page == "Προβλέψεις & Πραγματικές Ρυθμίσεις":
@@ -738,7 +748,7 @@ elif page == "Προβλέψεις & Πραγματικές Ρυθμίσεις":
                 row_update = row.copy()
                 row_update["real_debts_json"] = json.dumps(real_list, ensure_ascii=False)
 
-                # Προαιρετικό roll-up
+                # Προαιρετικό roll-up (αν θες να βλέπεις συγκεντρωτικά)
                 try:
                     monthly_vals = [x.get("real_monthly") for x in real_list if x.get("real_monthly") is not None]
                     row_update["real_monthly"] = float(np.mean(monthly_vals)) if monthly_vals else None
@@ -755,13 +765,13 @@ elif page == "Προβλέψεις & Πραγματικές Ρυθμίσεις":
 # ────────────────────────────── ΕΚΠΑΙΔΕΥΣΗ ΜΟΝΤΕΛΟΥ ──────────────────────────────
 else:
     st.title("🤖 Εκπαίδευση & Απόδοση Μοντέλου")
-    if df_all.empty or df_all.dropna(subset=["real_monthly"]).empty or (not XGB_AVAILABLE):
-        st.info("Χρειάζονται υποθέσεις με πραγματικές ρυθμίσεις **και** εγκατεστημένο XGBoost για εκπαίδευση.")
+    if df_all.empty or df_all.dropna(subset=["real_monthly"]).empty:
+        st.info("Χρειάζονται υποθέσεις με πραγματικές ρυθμίσεις για εκπαίδευση.")
     else:
         with st.spinner("Εκπαίδευση..."):
             model, mae = train_if_labels(df_all)
         if model is None:
-            st.warning("Δεν επαρκούν δεδομένα για εκπαίδευση.")
+            st.warning("Δεν επαρκούν δεδομένα (ή XGBoost μη διαθέσιμο).")
         else:
             st.success("Το μοντέλο εκπαιδεύτηκε.")
             if mae is not None:
