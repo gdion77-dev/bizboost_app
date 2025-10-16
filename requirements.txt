@@ -2,10 +2,8 @@ streamlit==1.38.0
 pandas
 numpy
 scikit-learn
-joblib
+SQLAlchemy>=2.0
+psycopg[binary]
 reportlab
 openpyxl
 XlsxWriter
-SQLAlchemy>=2.0
-psycopg[binary]
-rich==13.9.4
