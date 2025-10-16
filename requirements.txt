@@ -2,12 +2,14 @@ streamlit==1.38.0
 pandas
 numpy
 scikit-learn
+<<<<<<< HEAD
 joblib
 xgboost
+=======
+SQLAlchemy>=2.0
+psycopg[binary]
+>>>>>>> 0d5a678 (Local changes before rebase)
 reportlab
 shap
 openpyxl
 XlsxWriter
-SQLAlchemy>=2.0
-psycopg[binary]
-rich==13.9.4
