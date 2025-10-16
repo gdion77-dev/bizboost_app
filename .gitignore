@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Envs
+venv/
+.venv/
+
+# Streamlit local secrets (μην ανέβει)
+.streamlit/secrets.toml
+
+# Προαιρετικά
+models/
+*.pdf
+
+# Backups
+*.bak
+cases.bak
