@@ -2,7 +2,7 @@
 # Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF)
 # - Ελληνικό UI
 # - Supabase Postgres μέσω SQLAlchemy + psycopg v3
-# - PDF (ReportLab) με NotoSans για σωστά Ελληνικά, επαγγελματικό header/footer & πίνακες
+# - PDF (ReportLab) με NotoSans/NotoSerif για σωστά Ελληνικά, κεντραρισμένο λογότυπο & πίνακες
 # - Συνοφειλέτες: annual_income (ετήσιο) -> monthly, αφαίρεση ΕΔΔ ανά συνοφειλέτη
 # - Κανόνες εξωδικαστικού: ΑΑΔΕ/ΕΦΚΑ 240μήνες, Τράπεζες/Servicers 420μήνες, κόφτης ηλικίας
 # - Κατανομή διαθέσιμου: Δημόσιο -> Εξασφαλισμένα -> Λοιπά (priority)
@@ -21,11 +21,11 @@ from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    BaseDocTemplate, PageTemplate, Frame, Paragraph, Table, TableStyle,
-    Spacer, Image, KeepInFrame
+    SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image
 )
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfgen import canvas  # για custom header/footer
 
 # ────────────────────────────── UI / PATHS ──────────────────────────────
 st.set_page_config(page_title="Bizboost - Εξωδικαστικός", page_icon="💠", layout="wide")
@@ -40,7 +40,7 @@ FONT_CANDIDATES = [
     ("NotoSans",  os.path.join(FONT_DIR, "NotoSans-Regular.ttf")),
     ("NotoSerif", os.path.join(FONT_DIR, "NotoSerif-Regular.ttf")),
 ]
-PDF_FONT = "Helvetica"  # fallback
+PDF_FONT = "Helvetica"  # ασφαλές fallback αν δεν βρεθεί έγκυρο TTF
 
 try:
     chosen = None
@@ -55,7 +55,7 @@ try:
     if chosen:
         PDF_FONT = chosen
     else:
-        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica.")
+        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica (ενδέχεται να μην αποδοθούν σωστά τα ελληνικά στο PDF).")
 except Exception as e:
     st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF: {e}")
     PDF_FONT = "Helvetica"
@@ -70,14 +70,15 @@ CREDITORS = list(PUBLIC_CREDITORS) + list(BANK_SERVICERS)
 LOAN_TYPES = ["Στεγαστικό","Καταναλωτικό","Επαγγελματικό"]
 
 POLICY = {
-    "priority": ["PUBLIC", "SECURED", "UNSECURED"],
+    "priority": ["PUBLIC", "SECURED", "UNSECURED"],  # σειρά εξυπηρέτησης
     "term_caps": {"PUBLIC": 240, "BANK": 420, "DEFAULT": 240},
     "allocate": "priority_first",  # "priority_first" ή "proportional"
-    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},
+    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},  # π.χ. 0.4 για 40%
 }
 
 # ─────────────────────── ΕΔΔ & ΔΙΑΘΕΣΙΜΑ ───────────────────────
 def compute_edd(adults:int, children:int)->float:
+    """ΕΔΔ: 1 ενήλικας 537€, κάθε επιπλέον ενήλικας +269€, κάθε ανήλικος +211€."""
     if adults <= 0 and children <= 0:
         return 0.0
     base_adult = 537
@@ -113,6 +114,7 @@ def term_cap_for(creditor:str, age_cap:int, secured:bool)->int:
     return max(1, min(base, age_cap))
 
 def security_floor(balance:float, secured:bool, collateral_value:float)->float:
+    """Κατώφλι λόγω εξασφάλισης: δεν διαγράφεις κάτω από (balance - collateral)."""
     if not secured:
         return 0.0
     return max(0.0, float(balance or 0.0) - float(collateral_value or 0.0))
@@ -123,6 +125,7 @@ def split_available_proportional(avail:float, debts:list)->dict:
     return {i: avail * (d["balance"]/total) for i,d in enumerate(debts)}
 
 def split_available_priority(avail:float, debts:list)->dict:
+    """Πρώτα PUBLIC (αναλογικά μεταξύ τους), μετά SECURED, μετά UNSECURED."""
     out = {i:0.0 for i in range(len(debts))}
     groups = {"PUBLIC":[], "SECURED":[], "UNSECURED":[]}
     for i,d in enumerate(debts):
@@ -282,7 +285,7 @@ def load_data():
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 
-# ────────────────────────────── PDF EXPORT (νέο layout) ──────────────────────────────
+# ────────────────────────────── PDF HELPERS ──────────────────────────────
 # Στοιχεία επικοινωνίας (footer)
 CONTACT_NAME    = "Γεώργιος Φ. Διονυσίου Οικονομολόγος BA, MSc"
 CONTACT_PHONE   = "+30 2273081618"
@@ -290,17 +293,34 @@ CONTACT_EMAIL   = "info@bizboost.gr"
 CONTACT_SITE    = "www.bizboost.gr"
 CONTACT_ADDRESS = "Αγίου Νικολάου 1, Σάμος 83100"
 
+def _available_width(doc):
+    return doc.pagesize[0] - doc.leftMargin - doc.rightMargin  # σε points
+
+def _cm_list_to_points(widths_cm, doc):
+    """Μετατρέπει λίστα σε cm και την κλιμακώνει ώστε να χωράει στο διαθέσιμο πλάτος."""
+    pts = [w*cm for w in widths_cm]
+    total = sum(pts)
+    avail = _available_width(doc)
+    if total > avail and total > 0:
+        scale = avail / total
+        pts = [p*scale for p in pts]
+    return pts
+
 def _personalized_reasoning(case_dict):
+    # Δεδομένα για εξήγηση
     mi   = float(case_dict.get("monthly_income",0) or 0)
     edd  = float(case_dict.get("edd_household",0) or 0)
     extra= float(case_dict.get("extras_sum",0) or 0)
     avail= float(case_dict.get("avail",0) or 0)
     debts= case_dict.get("debts",[]) or []
+    # Μετρήσεις ομάδων
     public_cnt  = sum(1 for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS)
     secured_cnt = sum(1 for d in debts if bool(d.get("secured")))
     other_cnt   = max(0, len(debts) - public_cnt - secured_cnt)
+    # Όροφοι ανά κατηγορία (ό,τι υπάρχει)
     public_terms  = sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS and d.get("term_cap")})
     bank_terms    = sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in BANK_SERVICERS and d.get("term_cap")})
+    # Μικρές φράσεις
     line1 = (
         f"Η πρόταση διαμορφώθηκε με βάση το καθαρό διαθέσιμο εισόδημα **{avail:,.2f} €** "
         f"(μηνιαίο εισόδημα **{mi:,.2f} €** − ΕΔΔ **{edd:,.2f} €** − πρόσθετες δαπάνες **{extra:,.2f} €**)."
@@ -310,178 +330,137 @@ def _personalized_reasoning(case_dict):
         cap_info = f"με όριο **{max(public_terms) if public_terms else 240} μήνες**" if public_terms else "έως **240 μήνες**"
         parts.append(f"Για τις απαιτήσεις Δημοσίου (ΑΑΔΕ/ΕΦΚΑ, {public_cnt} οφειλή/ές) χρησιμοποιήθηκε μέγιστη διάρκεια {cap_info}.")
     if secured_cnt:
-        parts.append("Για τις εξασφαλισμένες οφειλές ελήφθη υπόψη η εξασφάλιση (security floor).")
+        parts.append(f"Για τις εξασφαλισμένες οφειλές ({secured_cnt} οφειλή/ές) ελήφθη υπόψη η εξασφάλιση, ώστε το υπόλοιπο να μην πέφτει κάτω από το ποσό μετά την εξασφάλιση (security floor).")
     if other_cnt:
         cap_bank = f"{max(bank_terms)} μήνες" if bank_terms else "έως **420 μήνες**"
-        parts.append(f"Για τις λοιπές τραπεζικές/servicers οφειλές εφαρμόστηκε μέγιστη διάρκεια {cap_bank}.")
+        parts.append(f"Για τις λοιπές τραπεζικές/servicers οφειλές ({other_cnt} οφειλή/ές) εφαρμόστηκε μέγιστη διάρκεια {cap_bank}.")
     dist = "Η κατανομή του διαθέσιμου έγινε με προτεραιότητα: **Δημόσιο → Εξασφαλισμένα → Λοιπά**."
-    end = "Το υπόλοιπο προς ρύθμιση = **Υπόλοιπο − Διαγραφή** και το κούρεμα = **Διαγραφή / Υπόλοιπο**."
+    end = "Το υπόλοιπο προς ρύθμιση ανά οφειλή υπολογίζεται ως **Υπόλοιπο − Διαγραφή**, ενώ το ποσοστό κουρέματος ως **Διαγραφή / Υπόλοιπο**."
     return " ".join([line1, *parts, dist, end])
 
-def _draw_header_footer(canvas, doc):
-    # Header: λογότυπο στο κέντρο + τίτλος κάτω από αυτό
-    canvas.saveState()
-    page_w, page_h = doc.pagesize
-    # Logo (ασφαλής κλίμακα)
-    if os.path.exists(LOGO_PATH):
+class HeaderFooterCanvas(canvas.Canvas):
+    """Ζωγραφίζει logo στο header & στοιχεία στο footer σε κάθε σελίδα."""
+    def draw_header_footer(self):
+        w, h = self._pagesize
+        # Header: logo κεντραρισμένο (ασφαλής κλίμακα)
         try:
-            # μέγιστο πλάτος 150pt, αναλογία ύψους αυτόματα
-            img = Image(LOGO_PATH, width=150)
-            iw, ih = img.wrap(0, 0)
-            x = (page_w - iw) / 2.0
-            y = page_h - 2.2*cm  # επάνω ζώνη
-            img.drawOn(canvas, x, y)
+            self.drawImage(
+                LOGO_PATH, (w - 150) / 2.0, h - 90,  # Y: λίγο κάτω από το πάνω όριο
+                width=150, preserveAspectRatio=True, mask='auto'
+            )
         except Exception:
             pass
 
-    # Footer: λεπτή γραμμή + 2 γραμμές στοιχείων στο κέντρο, πάντα κάτω-κάτω
-    footer_y = 1.5*cm
-    canvas.setStrokeColor(colors.HexColor("#D5DDE5"))
-    canvas.setLineWidth(0.8)
-    canvas.line(doc.leftMargin, footer_y + 0.5*cm, page_w - doc.rightMargin, footer_y + 0.5*cm)
+        # Footer: γραμμή + 2 σειρές κεντραρισμένες (πάντα κάτω κάτω)
+        self.setStrokeColor(colors.HexColor("#DDDDDD"))
+        self.setLineWidth(1)
+        self.line(2*cm, 1.8*cm, w - 2*cm, 1.8*cm)
 
-    canvas.setFont(PDF_FONT, 8)
-    footer1 = f"{CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE}"
-    footer2 = f"{CONTACT_ADDRESS}"
-    # κέντρο
-    canvas.drawCentredString(page_w/2.0, footer_y + 0.28*cm, footer1)
-    canvas.drawCentredString(page_w/2.0, footer_y, footer2)
-    canvas.restoreState()
+        self.setFont(PDF_FONT, 8)
+        footer1 = f"{CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE}"
+        footer2 = f"{CONTACT_ADDRESS}"
+        self.drawCentredString(w/2.0, 1.5*cm, footer1)
+        self.drawCentredString(w/2.0, 1.2*cm, footer2)
 
-def _table_wrap_paragraph(text, size=9, bold=False, align="LEFT"):
-    style = ParagraphStyle(
-        name=f"TCell{size}{'B' if bold else ''}",
-        fontName=PDF_FONT,
-        fontSize=size,
-        leading=size+2,
-        alignment={"LEFT":0, "CENTER":1, "RIGHT":2}.get(align,0)
-    )
-    return Paragraph(text, style)
+    def showPage(self):
+        self.draw_header_footer()
+        super().showPage()
 
+    def save(self):
+        self.draw_header_footer()  # για την τελευταία σελίδα
+        super().save()
+
+# ────────────────────────────── PDF EXPORT ──────────────────────────────
 def make_pdf(case_dict:dict)->bytes:
     buf = io.BytesIO()
-
-    # Frames: αφήνουμε χώρο για header (logo) και footer
-    page_w, page_h = A4
-    left = 2*cm; right = 2*cm; top = 3.6*cm; bottom = 2.3*cm
-
-    frame = Frame(
-        left, bottom, page_w-left-right, page_h-top-bottom,
-        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, id='normal'
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2.2*cm
     )
-    doc = BaseDocTemplate(buf, pagesize=A4, leftMargin=left, rightMargin=right,
-                          topMargin=top, bottomMargin=bottom)
-    doc.addPageTemplates(PageTemplate(id='Main', frames=[frame], onPage=_draw_header_footer))
-
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H1", fontName=PDF_FONT, fontSize=18, leading=22, spaceAfter=10,
-                              textColor=colors.HexColor("#0F4C81"), alignment=1))
-    styles.add(ParagraphStyle(name="H2", fontName=PDF_FONT, fontSize=12, leading=16, spaceAfter=6,
-                              textColor=colors.HexColor("#333")))
-    styles.add(ParagraphStyle(name="P",  fontName=PDF_FONT, fontSize=10, leading=14))
+    base_font = PDF_FONT
+    styles.add(ParagraphStyle(name="H1", fontName=base_font, fontSize=16, leading=20, spaceAfter=10, textColor=colors.HexColor("#0F4C81"), alignment=1))
+    styles.add(ParagraphStyle(name="H2", fontName=base_font, fontSize=12, leading=16, spaceAfter=6, textColor=colors.HexColor("#333333")))
+    styles.add(ParagraphStyle(name="P",  fontName=base_font, fontSize=10, leading=14))
 
     story = []
 
-    # Κεντρικός τίτλος (logo μπαίνει από το onPage)
-    story.append(Spacer(1, 0.8*cm))
+    # Τίτλος (το λογότυπο μπαίνει από το Canvas)
     story.append(Paragraph("Bizboost – Πρόβλεψη Ρύθμισης", styles["H1"]))
-    story.append(Spacer(1, 0.2*cm))
 
-    # ── Meta στοιχεία σε πραγματικές 2 στήλες (labels/values αριστερά-δεξιά)
-    meta_pairs = [
-        ("Υπόθεση", case_dict.get("case_id","")),
-        ("Οφειλέτης", case_dict.get("borrower","")),
-        ("Ηλικία", str(case_dict.get("debtor_age",""))),
-        ("Μέλη νοικοκυριού (ενήλ./ανήλ.)", f"{case_dict.get('adults',0)}/{case_dict.get('children',0)}"),
-        ("Συνολικό μηνιαίο εισόδημα", f"{case_dict.get('monthly_income',0):,.2f} €"),
-        ("ΕΔΔ νοικοκυριού", f"{case_dict.get('edd_household',0):,.2f} €"),
-        ("Επιπλέον δαπάνες", f"{case_dict.get('extras_sum',0):,.2f} €"),
-        ("Καθαρό διαθέσιμο", f"{case_dict.get('avail',0):,.2f} €"),
-        ("Ακίνητη περιουσία", f"{case_dict.get('property_value',0):,.2f} €"),
-        ("Ημερομηνία", case_dict.get("predicted_at","")),
+    # Πίνακας Περίληψης (δύο στήλες, auto-scale πλάτους)
+    meta = [
+        ["Υπόθεση", case_dict.get("case_id","")],
+        ["Οφειλέτης", case_dict.get("borrower","")],
+        ["Ηλικία", str(case_dict.get("debtor_age",""))],
+        ["Μέλη νοικοκυριού (ενήλ./ανήλ.)", f"{case_dict.get('adults',0)}/{case_dict.get('children',0)}"],
+        ["Συνολικό μηνιαίο εισόδημα", f"{case_dict.get('monthly_income',0):,.2f} €"],
+        ["ΕΔΔ νοικοκυριού", f"{case_dict.get('edd_household',0):,.2f} €"],
+        ["Επιπλέον δαπάνες", f"{case_dict.get('extras_sum',0):,.2f} €"],
+        ["Καθαρό διαθέσιμο", f"{case_dict.get('avail',0):,.2f} €"],
+        ["Ακίνητη περιουσία", f"{case_dict.get('property_value',0):,.2f} €"],
+        ["Ημερομηνία", case_dict.get("predicted_at","")],
     ]
-    # Σπάμε στα δύο (πάνω-κάτω ισόποσα)
-    mid = len(meta_pairs)//2 + len(meta_pairs)%2
-    left_col = meta_pairs[:mid]
-    right_col= meta_pairs[mid:]
+    meta_widths_cm = [6.0, 9.5]
+    t = Table(meta, colWidths=_cm_list_to_points(meta_widths_cm, doc))
+    t.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,-1), base_font, 10),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#DDD")),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#AAA")),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F5F7FA")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FAFAFA")]),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING",(0,0), (-1,-1), 6),
+        ("TOPPADDING",(0,0), (-1,-1), 4),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 10))
 
-    def kv_table(pairs):
-        rows = [[_table_wrap_paragraph(f"<b>{k}</b>", 10), _table_wrap_paragraph(v, 10)] for k,v in pairs]
-        t = Table(rows, colWidths=[6.0*cm, 7.2*cm])
-        t.setStyle(TableStyle([
-            ("FONT", (0,0), (-1,-1), PDF_FONT, 10),
-            ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#C8D3E1")),
-            ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#7EA0C8")),
-            ("BACKGROUND", (0,0), (-1,-1), colors.white),
-            ("ROWBACKGROUNDS", (0,0), (-1,-1), [colors.white, colors.HexColor("#F7FAFF")]),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING",(0,0), (-1,-1), 6),
-            ("TOPPADDING",(0,0), (-1,-1), 4),
-            ("BOTTOMPADDING",(0,0), (-1,-1), 4),
-        ]))
-        return t
-
-    meta_2col = Table(
-        [[kv_table(left_col), kv_table(right_col)]],
-        colWidths=[(A4[0]-left-right)/2.0 - 0.5*cm, (A4[0]-left-right)/2.0 - 0.5*cm]
-    )
-    meta_2col.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story.append(meta_2col)
-    story.append(Spacer(1, 0.6*cm))
-
-    # ── Αναλυτικά ανά οφειλή (με αναδιπλώσεις κεφαλίδων)
+    # Πίνακας οφειλών (κλιμακωτές στήλες, repeat header, αναγνώσιμο περιεχόμενο)
     debts = case_dict.get("debts", [])
     if debts:
         story.append(Paragraph("Αναλυτικά ανά οφειλή (πρόβλεψη):", styles["H2"]))
-
-        header = [
-            "Πιστωτής","Είδος","Υπόλοιπο (€)","Εξασφ.",
-            "Εξασφάλιση (€)","Οροφή\nμηνών",
-            "Πρόταση\nδόσης (€)","Διαγραφή (€)",
-            "Υπόλοιπο\nΡύθμισης (€)","Κούρεμα (%)"
-        ]
-        header_cells = [_table_wrap_paragraph(f"<b>{h}</b>", size=8, align="CENTER") for h in header]
-        rows = [header_cells]
+        rows = [["Πιστωτής","Είδος","Υπόλοιπο (€)","Εξασφαλ.","Εξασφάλιση (€)","Οροφή μηνών","Πρόταση δόσης (€)","Διαγραφή (€)","Υπόλοιπο Ρύθμισης (€)","Κούρεμα (%)"]]
         for d in debts:
             rows.append([
-                _table_wrap_paragraph(d.get("creditor",""), 9),
-                _table_wrap_paragraph(d.get("loan_type",""), 9),
-                _table_wrap_paragraph(f"{float(d.get('balance',0)):,.2f}", 9, align="RIGHT"),
-                _table_wrap_paragraph("Ναι" if d.get("secured") else "Όχι", 9, align="CENTER"),
-                _table_wrap_paragraph(f"{float(d.get('collateral_value',0)):,.2f}" if d.get("secured") else "0.00", 9, align="RIGHT"),
-                _table_wrap_paragraph(str(d.get("term_cap","")), 9, align="RIGHT"),
-                _table_wrap_paragraph(f"{float(d.get('predicted_monthly',0)):,.2f}", 9, align="RIGHT"),
-                _table_wrap_paragraph(f"{float(d.get('predicted_writeoff',0)):,.2f}", 9, align="RIGHT"),
-                _table_wrap_paragraph(f"{float(d.get('predicted_residual',0)):,.2f}", 9, align="RIGHT"),
-                _table_wrap_paragraph(f"{float(d.get('predicted_haircut_pct',0)):.1f}%", 9, align="RIGHT"),
+                d.get("creditor",""),
+                d.get("loan_type",""),
+                f"{float(d.get('balance',0)):,.2f}",
+                "Ναι" if d.get("secured") else "Όχι",
+                f"{float(d.get('collateral_value',0)):,.2f}" if d.get("secured") else "0.00",
+                str(d.get("term_cap","")),
+                f"{float(d.get('predicted_monthly',0)):,.2f}",
+                f"{float(d.get('predicted_writeoff',0)):,.2f}",
+                f"{float(d.get('predicted_residual',0)):,.2f}",
+                f"{float(d.get('predicted_haircut_pct',0)):.1f}%",
             ])
-
-        col_widths = [2.6*cm, 2.1*cm, 2.2*cm, 1.1*cm, 1.9*cm, 1.6*cm, 2.2*cm, 2.2*cm, 2.3*cm, 1.2*cm]
-        t = Table(rows, colWidths=col_widths, repeatRows=1)
-        t.setStyle(TableStyle([
+        debt_widths_cm = [2.6, 2.1, 2.2, 1.0, 1.8, 1.6, 2.1, 2.1, 2.2, 1.1]
+        tt = Table(rows, colWidths=_cm_list_to_points(debt_widths_cm, doc), repeatRows=1)
+        tt.setStyle(TableStyle([
+            ("FONT", (0,0), (-1,-1), base_font, 9),
             ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0F4C81")),
             ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("FONT", (0,0), (-1,0), PDF_FONT, 8),
-            ("FONT", (0,1), (-1,-1), PDF_FONT, 9),
             ("ALIGN", (2,1), (-1,-1), "RIGHT"),
-            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-            ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#D9E2EF")),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#DDD")),
             ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#0F4C81")),
             ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FAFAFA")]),
-            ("LEFTPADDING",(0,0),(-1,-1),4),
-            ("RIGHTPADDING",(0,0),(-1,-1),4),
-            ("BOTTOMPADDING",(0,0),(-1,-1),4),
-            ("TOPPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING",(0,0), (-1,-1), 4),
         ]))
-        # προσαρμογή αν ξεφεύγει: KeepInFrame
-        story.append(KeepInFrame(A4[0]-left-right, 10*cm, [t], mode='shrink'))
-        story.append(Spacer(1, 0.5*cm))
+        story.append(tt)
+        story.append(Spacer(1, 10))
 
-    # ── Προσωποποιημένο σκεπτικό
+    # Προσωποποιημένο σκεπτικό
     story.append(Paragraph("Σκεπτικό πρότασης", styles["H2"]))
     story.append(Paragraph(_personalized_reasoning(case_dict), styles["P"]))
 
-    doc.build(story, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
+    # Build με custom canvas για header/footer
+    doc.build(story, canvasmaker=HeaderFooterCanvas)
+
     buf.seek(0)
     return buf.read()
 
@@ -508,6 +487,7 @@ if page == "Νέα Πρόβλεψη":
         annual_rate_pct= col3.number_input("Επιτόκιο ετησίως (%) (πληροφ.)", 0.0, 30.0, 6.0, step=0.1)
 
         st.markdown("### Συνοφειλέτες (προαιρετικά)")
+        # data_editor: name, annual_income, property_value, age, adults, children
         codebtors_df_default = pd.DataFrame([{
             "name": "", "annual_income": 0.0, "property_value": 0.0, "age": 40, "adults": 1, "children": 0
         }])
@@ -560,7 +540,9 @@ if page == "Νέα Πρόβλεψη":
         submitted = st.form_submit_button("Υπολογισμός Πρόβλεψης & Αποθήκευση", use_container_width=True)
 
     if submitted:
+        # Συνοφειλέτες -> λίστα αντικειμένων
         codebtors = codebtors_df.fillna(0).to_dict(orient="records")
+        # Υπολογισμός μηνιαίου εισοδήματος & ΕΔΔ συνοφειλετών
         monthly_income_codes = 0.0
         edd_codes = 0.0
         for c in codebtors:
@@ -572,6 +554,7 @@ if page == "Νέα Πρόβλεψη":
         monthly_income = float(monthly_income_main + monthly_income_codes)
         edd_total_house = float(edd_val + edd_codes)
 
+        # Συγκεντρωτικά / οφειλές
         debts = debts_df.fillna(0).to_dict(orient="records")
         total_debt  = sum([float(d["balance"] or 0) for d in debts])
         secured_amt = sum([float(d["collateral_value"] or 0) for d in debts if d.get("secured")])
@@ -580,6 +563,7 @@ if page == "Νέα Πρόβλεψη":
         avail = available_income(monthly_income, edd_total_house, extra_medical, extra_students, extra_legal)
         age_cap_months = months_cap_from_age(int(debtor_age))
 
+        # Εμπλουτισμός οφειλών για κανόνες
         enriched = []
         for d in debts:
             enriched.append({
@@ -591,8 +575,10 @@ if page == "Νέα Πρόβλεψη":
                 "cat": classify_debt(str(d.get("creditor","")).strip(), bool(d.get("secured"))),
             })
 
+        # Κατανομή διαθέσιμου
         shares = split_available_priority(avail, enriched) if POLICY["allocate"]=="priority_first" else split_available_proportional(avail, enriched)
 
+        # Υπολογισμός ανά οφειλή
         per_debt_rows = []
         debts_to_store = []
         for i, d in enumerate(enriched):
@@ -627,6 +613,7 @@ if page == "Νέα Πρόβλεψη":
         st.dataframe(pd.DataFrame(per_debt_rows), use_container_width=True)
         st.info("Κατανομή διαθέσιμου: Δημόσιο → Εξασφαλισμένα → Λοιπά (προτεραιότητα).")
 
+        # Αποθήκευση
         case_id = f"CASE-{uuid.uuid4().hex[:8].upper()}"
         now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -663,6 +650,7 @@ if page == "Νέα Πρόβλεψη":
         save_data(pd.DataFrame([row]))
         st.success(f"✅ Αποθηκεύτηκε η πρόβλεψη: {case_id}")
 
+        # PDF
         case_for_pdf = {
             "case_id": case_id,
             "borrower": borrower,
