@@ -286,10 +286,11 @@ def save_data(df: pd.DataFrame):
 # ▼▼▼ Προσθήκες: κεντραρισμένο λογότυπο, αυτόματη κλίμακα πινάκων, footer, προσωποποιημένο σκεπτικό ▼▼▼
 
 # Στοιχεία επικοινωνίας για footer
-CONTACT_NAME = "Bizboost"
-CONTACT_PHONE = "+30 210 0000000"
+CONTACT_NAME = "Γεώργιος Φ. Διονυσίου Οικονομολόγος BA, MSc"
+CONTACT_PHONE = "+30 2273081618"
 CONTACT_EMAIL = "info@bizboost.gr"
 CONTACT_SITE  = "www.bizboost.gr"
+CONTACT_ADRESS = "Αγίου Νικολάου 1, Σάμος 83100"
 
 def _available_width(doc):
     return doc.pagesize[0] - doc.leftMargin - doc.rightMargin  # σε points
