@@ -352,15 +352,32 @@ def make_pdf(case_dict:dict)->bytes:
 
     story = []
 
-    # ΚΕΝΤΡΑΡΙΣΜΕΝΟ ΛΟΓΟΤΥΠΟ χωρίς παραμόρφωση (κρατάμε μόνο width)
-    if os.path.exists(LOGO_PATH):
-        try:
-            img = Image(LOGO_PATH, width=160)  # ύψος αυτόματο (διατηρεί αναλογία)
-            img.hAlign = 'CENTER'
-            story.append(img)
-            story.append(Spacer(1, 6))
-        except Exception:
-            pass
+   # ΚΕΝΤΡΑΡΙΣΜΕΝΟ ΛΟΓΟΤΥΠΟ με ασφαλή κλιμάκωση (χωρίς LayoutError)
+if os.path.exists(LOGO_PATH):
+    try:
+        # Διάβασε πραγματικές διαστάσεις εικόνας
+        ir = ImageReader(LOGO_PATH)
+        iw, ih = ir.getSize()  # pixels
+
+        # Μέγιστο πλάτος λογοτύπου: 45% του διαθέσιμου πλάτους ή 160pt (ό,τι μικρότερο)
+        avail_w = _available_width(doc)
+        target_w = min(avail_w * 0.45, 160)  # points
+        # Διατήρηση λόγου πλευρών
+        scale = target_w / float(iw)
+        target_h = ih * scale
+
+        # Προστασία: αν για κάποιο λόγο βγει πολύ ψηλό, κόψ’ το στα 60pt
+        if target_h > 60:
+            target_h = 60
+            target_w = iw * (target_h / float(ih))
+
+        img = Image(LOGO_PATH, width=target_w, height=target_h)
+        img.hAlign = "CENTER"
+        story.append(img)
+        story.append(Spacer(1, 8))
+    except Exception:
+        # Αν κάτι πάει στραβά, απλώς αγνόησε το λογότυπο
+        pass
 
     story.append(Paragraph("Bizboost – Πρόβλεψη Ρύθμισης", styles["H1"]))
 
