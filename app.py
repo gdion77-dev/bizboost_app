@@ -337,22 +337,29 @@ def _personalized_reasoning(case_dict):
     end = "Το υπόλοιπο προς ρύθμιση ανά οφειλή υπολογίζεται ως **Υπόλοιπο − Διαγραφή**, ενώ το ποσοστό κουρέματος ως **Διαγραφή / Υπόλοιπο**."
     return " ".join([line1, *parts, dist, end])
 
+# --- ΟΡΙΖΟΝΤΙΑ ΓΡΑΜΜΗ ΓΙΑ ΤΟ FOOTER (ασφαλής σε όλα τα frames) ---
 class HR(Flowable):
-    """Οριζόντια γραμμή για το footer."""
-    def __init__(self, width=1, color=colors.HexColor("#DDD")):
-        Flowable.__init__(self)
-        self.width = width
+    def __init__(self, thickness=0.8, color=colors.HexColor("#DDDDDD"), vspace=4):
+        super().__init__()
+        self.thickness = thickness
         self.color = color
-        self.height = 5
+        self.vspace = vspace
+        self._width = 0  # θα το πάρουμε στο wrap()
+
+    def wrap(self, availWidth, availHeight):
+        self._width = availWidth
+        # ύψος που “πιάνει” το flowable: πάνω/κάτω κενό + πάχος γραμμής
+        return availWidth, (self.vspace * 2 + self.thickness)
 
     def draw(self):
         c = self.canv
-        w = c._pagesize[0] - c.leftMargin - c.rightMargin
-        x0 = c.leftMargin
-        y  = 2  # λίγα pt πάνω από το κάτω μέρος του flowable
+        c.saveState()
         c.setStrokeColor(self.color)
-        c.setLineWidth(self.width)
-        c.line(x0, y, x0 + w, y)
+        c.setLineWidth(self.thickness)
+        y = self.vspace
+        # γραμμή από την αρχή του frame (x=0) μέχρι το διαθέσιμο πλάτος του frame
+        c.line(0, y, self._width, y)
+        c.restoreState()
 
 def make_pdf(case_dict:dict)->bytes:
     buf = io.BytesIO()
@@ -711,7 +718,6 @@ else:
                     real_resid   = max(0.0, float(d.get("balance",0) or 0.0) - float(real_write or 0.0))
                     col4.metric("Υπόλοιπο ρύθμισης (€)", f"{real_resid:,.2f}")
                     haircut_pct = 0.0 if (float(d.get("balance",0) or 0.0) <= 0) else 100.0 * (float(real_write or 0.0) / float(d.get("balance") or 1.0))
-                    st.caption(f"Ποσοστό κουρέματος: **{haircut_pct:.1f}%**")
                     real_list.append({
                         "creditor": d.get("creditor",""),
                         "loan_type": d.get("loan_type",""),
