@@ -2,7 +2,7 @@
 # Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF)
 # - Ελληνικό UI
 # - Supabase Postgres μέσω SQLAlchemy + psycopg v3
-# - PDF (ReportLab) με DejaVuSans για σωστά Ελληνικά, λογότυπο & πίνακες
+# - PDF (ReportLab) με NotoSans για σωστά Ελληνικά, λογότυπο & πίνακες
 # - Συνοφειλέτες: annual_income (ετήσιο) -> monthly, αφαίρεση ΕΔΔ ανά συνοφειλέτη
 # - Κανόνες εξωδικαστικού: ΑΑΔΕ/ΕΦΚΑ 240μήνες, Τράπεζες/Servicers 420μήνες, κόφτης ηλικίας
 # - Κατανομή διαθέσιμου: Δημόσιο -> Εξασφαλισμένα -> Λοιπά (priority)
@@ -29,17 +29,30 @@ st.set_page_config(page_title="Bizboost - Εξωδικαστικός", page_icon
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
-FONT_PATH = os.path.join(BASE_DIR, "assets", "fonts", "DejaVuSans.ttf")
 DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")  # προαιρετικό αρχικό import
 
-# Γραμματοσειρά για Ελληνικά στο PDF
+# ───────── Γραμματοσειρές για σωστά Ελληνικά στο PDF (NotoSans → NotoSerif → fallback) ─────────
+FONT_DIR = os.path.join(BASE_DIR, "assets", "fonts")
+FONT_CANDIDATES = [
+    ("NotoSans",  os.path.join(FONT_DIR, "NotoSans-Regular.ttf")),
+    ("NotoSerif", os.path.join(FONT_DIR, "NotoSerif-Regular.ttf")),
+]
+PDF_FONT = "Helvetica"  # ασφαλές fallback αν δεν βρεθεί έγκυρο TTF
+
 try:
-    if os.path.exists(FONT_PATH):
-        pdfmetrics.registerFont(TTFont("DejaVuSans", FONT_PATH))
-        PDF_FONT = "DejaVuSans"
+    chosen = None
+    for name, path in FONT_CANDIDATES:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 100_000:
+                pdfmetrics.registerFont(TTFont(name, path))
+                chosen = name
+                break
+        except Exception:
+            continue
+    if chosen:
+        PDF_FONT = chosen
     else:
-        st.warning("Λείπει η γραμματοσειρά PDF: assets/fonts/DejaVuSans.ttf")
-        PDF_FONT = "Helvetica"
+        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica (ενδέχεται να μην αποδοθούν σωστά τα ελληνικά στο PDF).")
 except Exception as e:
     st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF: {e}")
     PDF_FONT = "Helvetica"
@@ -122,7 +135,7 @@ def split_available_priority(avail:float, debts:list)->dict:
     remaining = avail
     for key in POLICY["priority"]:
         idxs = groups.get(key, [])
-        if not idxs: 
+        if not idxs:
             continue
         subtotal = sum(debts[i]["balance"] for i in idxs if debts[i]["balance"]>0)
         if subtotal <= 0:
