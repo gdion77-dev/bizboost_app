@@ -283,14 +283,16 @@ def load_data():
 
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
-    def make_comparison_df(pred_debts, real_debts):
+def make_comparison_df(pred_debts, real_debts):
     """Return a DataFrame comparing forecast vs real per debt."""
-    def key_of(d):
-        return (str(d.get("creditor","")).strip(),
-                str(d.get("loan_type","")).strip(),
-                round(float(d.get("balance",0.0) or 0.0), 2))
+def key_of(d):
+        return (
+            str(d.get("creditor", "")).strip(),
+            str(d.get("loan_type", "")).strip(),
+            round(float(d.get("balance", 0.0) or 0.0), 2),
+        )
 
-    real_map = { key_of(r): r for r in (real_debts or []) }
+    real_map = {key_of(r): r for r in (real_debts or [])}
     rows = []
 
     for d in (pred_debts or []):
@@ -299,25 +301,25 @@ def save_data(df: pd.DataFrame):
 
         bal = float(d.get("balance", 0.0) or 0.0)
 
-        pred_monthly  = float(d.get("predicted_monthly", 0.0) or 0.0)
-        real_monthly  = float(r.get("real_monthly", 0.0) or 0.0)
+        pred_monthly = float(d.get("predicted_monthly", 0.0) or 0.0)
+        real_monthly = float(r.get("real_monthly", 0.0) or 0.0)
         delta_monthly = (real_monthly - pred_monthly) if real_monthly else None
 
-        pred_writeoff  = float(d.get("predicted_writeoff", 0.0) or 0.0)
-        real_writeoff  = float(r.get("real_writeoff", 0.0) or 0.0)
+        pred_writeoff = float(d.get("predicted_writeoff", 0.0) or 0.0)
+        real_writeoff = float(r.get("real_writeoff", 0.0) or 0.0)
         delta_writeoff = (real_writeoff - pred_writeoff) if real_writeoff else None
 
-        pred_resid  = float(d.get("predicted_residual", 0.0) or 0.0)
-        real_resid  = float(r.get("real_residual", 0.0) or (bal - real_writeoff))
+        pred_resid = float(d.get("predicted_residual", 0.0) or 0.0)
+        real_resid = float(r.get("real_residual", 0.0) or (bal - real_writeoff))
         delta_resid = (real_resid - pred_resid) if (real_writeoff or real_monthly) else None
 
         pred_hair = float(d.get("predicted_haircut_pct", 0.0) or 0.0)
-        real_hair = float(r.get("real_haircut_pct", 0.0) or (100.0 * real_writeoff / bal if bal>0 else 0.0))
+        real_hair = float(r.get("real_haircut_pct", 0.0) or (100.0 * real_writeoff / bal if bal > 0 else 0.0))
         delta_hair = (real_hair - pred_hair) if (real_writeoff or real_monthly) else None
 
         rows.append({
-            "Πιστωτής": d.get("creditor",""),
-            "Είδος": d.get("loan_type",""),
+            "Πιστωτής": d.get("creditor", ""),
+            "Είδος": d.get("loan_type", ""),
             "Υπόλοιπο (€)": bal,
             "Πρόβλεψη: Δόση (€)": pred_monthly,
             "Πραγματική: Δόση (€)": real_monthly if real_monthly else None,
