@@ -1,33 +1,77 @@
 # app.py
-# Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF)
+# Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF + ML prob_accept)
 # - Ελληνικό UI
 # - Supabase Postgres μέσω SQLAlchemy + psycopg v3
-# - PDF (WeasyPrint HTML/CSS) με καθαρό, επαγγελματικό layout:
-#   • Header label ("The Bizboost by G. Dionysiou") — no logo image required
-#   • Περίληψη σε 2 στήλες (dl)
-#   • Οφειλές σε 2 στήλες "cards" (dl ανά οφειλή, χωρίς στριμώγματα)
-#   • Footer pinned στο κάτω μέρος κάθε σελίδας με στοιχεία επικοινωνίας
+# - PDF (ReportLab) με NotoSans ή NotoSerif για σωστά Ελληνικά, λογότυπο/branding & πίνακες
 # - Συνοφειλέτες: annual_income (ετήσιο) -> monthly, αφαίρεση ΕΔΔ ανά συνοφειλέτη
 # - Κανόνες εξωδικαστικού: ΑΑΔΕ/ΕΦΚΑ 240μήνες, Τράπεζες/Servicers 420μήνες, κόφτης ηλικίας
 # - Κατανομή διαθέσιμου: Δημόσιο -> Εξασφαλισμένα -> Λοιπά (priority)
 # - Αποθήκευση πρόβλεψης + καταχώριση πραγματικών ρυθμίσεων ανά οφειλή
+# - ML: Πρόβλεψη πιθανότητας αποδοχής (scikit-learn)
 
-import os, io, json, uuid, datetime as dt
+import os, io, json, uuid, datetime as dt, tempfile
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from sqlalchemy import create_engine, text
 
-# PDF (WeasyPrint)
-from weasyprint import HTML, CSS
+# PDF (ReportLab)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+# ────────────────────────────── ML imports (guarded) ──────────────────────────────
+ML_AVAILABLE = True
+ML_IMPORT_ERR = ""
+try:
+    from typing import Tuple
+    import joblib
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import LogisticRegression
+except Exception as _e:
+    ML_AVAILABLE = False
+    ML_IMPORT_ERR = str(_e)
 
 # ────────────────────────────── UI / PATHS ──────────────────────────────
 st.set_page_config(page_title="Bizboost - Εξωδικαστικός", page_icon="💠", layout="wide")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(BASE_DIR, "logo.png")  # (δεν απαιτείται πλέον, κρατάμε για μελλοντική χρήση)
+LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
 DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")  # προαιρετικό αρχικό import
+
+# ───────── Γραμματοσειρές για σωστά Ελληνικά στο PDF (NotoSans → NotoSerif → fallback) ─────────
+FONT_DIR = os.path.join(BASE_DIR, "assets", "fonts")
+FONT_CANDIDATES = [
+    ("NotoSans",  os.path.join(FONT_DIR, "NotoSans-Regular.ttf")),
+    ("NotoSerif", os.path.join(FONT_DIR, "NotoSerif-Regular.ttf")),
+]
+PDF_FONT = "Helvetica"  # ασφαλές fallback αν δεν βρεθεί έγκυρο TTF
+
+try:
+    chosen = None
+    for name, path in FONT_CANDIDATES:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 100_000:
+                pdfmetrics.registerFont(TTFont(name, path))
+                chosen = name
+                break
+        except Exception:
+            continue
+    if chosen:
+        PDF_FONT = chosen
+    else:
+        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica (ίσως όχι τέλεια ελληνικά).")
+except Exception as e:
+    st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF: {e}")
+    PDF_FONT = "Helvetica"
 
 # ────────────────────────────── ΠΑΡΑΜΕΤΡΟΙ ΠΟΛΙΤΙΚΗΣ ──────────────────────────────
 PUBLIC_CREDITORS = {"ΑΑΔΕ", "ΕΦΚΑ"}
@@ -42,7 +86,7 @@ POLICY = {
     "priority": ["PUBLIC", "SECURED", "UNSECURED"],  # σειρά εξυπηρέτησης
     "term_caps": {"PUBLIC": 240, "BANK": 420, "DEFAULT": 240},
     "allocate": "priority_first",  # "priority_first" ή "proportional"
-    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},  # π.χ. 0.4 για 40%
+    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},
 }
 
 # ─────────────────────── ΕΔΔ & ΔΙΑΘΕΣΙΜΑ ───────────────────────
@@ -254,19 +298,109 @@ def load_data():
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 
-# ────────────────────────────── PDF: HTML + CSS (WeasyPrint) ──────────────────────────────
+# ────────────────────────────── ML: Probability of Acceptance ──────────────────────────────
+if ML_AVAILABLE:
+    @st.cache_resource(show_spinner=False)
+    def train_or_load_model(df_all: pd.DataFrame):
+        """
+        Train a simple logistic regression on historical cases if labels exist.
+        If not enough labeled data, return a default model so .predict_proba works.
+        """
+        model_path = os.path.join(tempfile.gettempdir(), "bizboost_accept_model.pkl")
 
+        if os.path.exists(model_path):
+            try:
+                return joblib.load(model_path)
+            except Exception:
+                pass
+
+        df = df_all.copy()
+        df["label"] = 0
+        df.loc[(df["accepted"] == 1) | (df["real_term_months"].fillna(0) > 0), "label"] = 1
+
+        df_labeled = df[df["label"].isin([0,1])]
+        if len(df_labeled) < 40 or df_labeled["label"].nunique() < 2:
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("clf", LogisticRegression(max_iter=1000))
+            ])
+            import numpy as _np
+            X_prior = _np.array([[0]*11, [1]*11], dtype=float)
+            y_prior = _np.array([0,1])
+            pipe.fit(X_prior, y_prior)
+            joblib.dump(pipe, model_path)
+            return pipe
+
+        X, y = build_features_from_cases(df_labeled)
+        pipe = Pipeline([
+            ("scaler", StandardScaler(with_mean=True, with_std=True)),
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced"))
+        ])
+        pipe.fit(X, y)
+        joblib.dump(pipe, model_path)
+        return pipe
+
+    def build_features_from_cases(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        feats = []
+        for _, r in df.iterrows():
+            age       = float(r.get("debtor_age") or 0)
+            adults    = float(r.get("adults") or 0)
+            children  = float(r.get("children") or 0)
+            income    = float(r.get("monthly_income") or 0)
+            prop_val  = float(r.get("property_value") or 0)
+            age_cap   = float(r.get("age_cap") or 0)
+            try:
+                debts = json.loads(r.get("debts_json") or "[]")
+            except Exception:
+                debts = []
+            n_debts = len(debts)
+            total_bal = sum(float(d.get("balance") or 0) for d in debts)
+            n_public  = sum(1 for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS)
+            n_secured = sum(1 for d in debts if bool(d.get("secured")))
+            avg_term  = np.mean([float(d.get("term_cap") or 0) for d in debts]) if debts else 0.0
+            feats.append([age, adults, children, income, prop_val, age_cap,
+                          n_debts, total_bal, n_public, n_secured, avg_term])
+        X = np.array(feats, dtype=float)
+        y = df["label"].astype(int).values
+        return X, y
+
+    def build_features_for_one(case_dict: dict) -> np.ndarray:
+        age       = float(case_dict.get("debtor_age") or 0)
+        adults    = float(case_dict.get("adults") or 0)
+        children  = float(case_dict.get("children") or 0)
+        income    = float(case_dict.get("monthly_income") or 0)
+        prop_val  = float(case_dict.get("property_value") or 0)
+        age_cap   = float(months_cap_from_age(int(age)) if age else 0)
+        debts     = case_dict.get("debts") or []
+        n_debts   = len(debts)
+        total_bal = sum(float(d.get("balance") or 0) for d in debts)
+        n_public  = sum(1 for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS)
+        n_secured = sum(1 for d in debts if bool(d.get("secured")))
+        avg_term  = np.mean([float(d.get("term_cap") or 0) for d in debts]) if debts else 0.0
+        vec = np.array([[age, adults, children, income, prop_val, age_cap,
+                         n_debts, total_bal, n_public, n_secured, avg_term]], dtype=float)
+        return vec
+
+# ────────────────────────────── PDF EXPORT (βελτιωμένο layout) ──────────────────────────────
+# Στοιχεία επικοινωνίας (footer)
 CONTACT_NAME    = "Γεώργιος Φ. Διονυσίου Οικονομολόγος BA, MSc"
 CONTACT_PHONE   = "+30 2273081618"
 CONTACT_EMAIL   = "info@bizboost.gr"
 CONTACT_SITE    = "www.bizboost.gr"
 CONTACT_ADDRESS = "Αγίου Νικολάου 1, Σάμος 83100"
 
-def _fmt_eur(x):
-    try:
-        return f"{float(x):,.2f} €"
-    except:
-        return str(x)
+def _available_width(doc):
+    return doc.pagesize[0] - doc.leftMargin - doc.rightMargin  # σε points
+
+def _cm_list_to_points(widths_cm, doc):
+    """Μετατρέπει λίστα σε cm και την κλιμακώνει ώστε να χωράει στο διαθέσιμο πλάτος."""
+    pts = [w*cm for w in widths_cm]
+    total = sum(pts)
+    avail = _available_width(doc)
+    if total > avail and total > 0:
+        scale = avail / total
+        pts = [p*scale for p in pts]
+    return pts
 
 def _personalized_reasoning(case_dict):
     mi   = float(case_dict.get("monthly_income",0) or 0)
@@ -277,292 +411,169 @@ def _personalized_reasoning(case_dict):
     public_cnt  = sum(1 for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS)
     secured_cnt = sum(1 for d in debts if bool(d.get("secured")))
     other_cnt   = max(0, len(debts) - public_cnt - secured_cnt)
-    public_terms  = sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS and d.get("term_cap")})
-    bank_terms    = sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in BANK_SERVICERS and d.get("term_cap")})
-
+    public_terms= sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in PUBLIC_CREDITORS and d.get("term_cap")})
+    bank_terms  = sorted({int(d.get("term_cap",0) or 0) for d in debts if str(d.get("creditor","")) in BANK_SERVICERS and d.get("term_cap")})
     line1 = (
-        f"Η πρόταση διαμορφώθηκε με βάση το καθαρό διαθέσιμο εισόδημα {avail:,.2f} € "
-        f"(μηνιαίο εισόδημα {mi:,.2f} € − ΕΔΔ {edd:,.2f} € − πρόσθετες δαπάνες {extra:,.2f} €)."
+        f"Η πρόταση διαμορφώθηκε με βάση το καθαρό διαθέσιμο εισόδημα **{avail:,.2f} €** "
+        f"(μηνιαίο εισόδημα **{mi:,.2f} €** − ΕΔΔ **{edd:,.2f} €** − πρόσθετες δαπάνες **{extra:,.2f} €**)."
     )
     parts = []
     if public_cnt:
-        cap_info = f"με όριο {max(public_terms) if public_terms else 240} μήνες" if public_terms else "έως 240 μήνες"
+        cap_info = f"με όριο **{max(public_terms) if public_terms else 240} μήνες**" if public_terms else "έως **240 μήνες**"
         parts.append(f"Για τις απαιτήσεις Δημοσίου (ΑΑΔΕ/ΕΦΚΑ, {public_cnt} οφειλή/ές) χρησιμοποιήθηκε μέγιστη διάρκεια {cap_info}.")
     if secured_cnt:
-        parts.append("Για τις εξασφαλισμένες οφειλές ελήφθη υπόψη η εξασφάλιση (security floor).")
+        parts.append(f"Για τις εξασφαλισμένες οφειλές ({secured_cnt} οφειλή/ές) ελήφθη υπόψη η εξασφάλιση (security floor).")
     if other_cnt:
-        cap_bank = f"{max(bank_terms)} μήνες" if bank_terms else "έως 420 μήνες"
-        parts.append(f"Για τις λοιπές τραπεζικές/servicers οφειλές εφαρμόστηκε μέγιστη διάρκεια {cap_bank}.")
-    dist = "Η κατανομή του διαθέσιμου έγινε με προτεραιότητα: Δημόσιο → Εξασφαλισμένα → Λοιπά."
-    end = "Το υπόλοιπο ρύθμισης ανά οφειλή είναι Υπόλοιπο − Διαγραφή και το ποσοστό κουρέματος είναι Διαγραφή / Υπόλοιπο."
+        cap_bank = f"{max(bank_terms)} μήνες" if bank_terms else "έως **420 μήνες**"
+        parts.append(f"Για τις λοιπές τραπεζικές/servicers οφειλές ({other_cnt} οφειλή/ές) εφαρμόστηκε μέγιστη διάρκεια {cap_bank}.")
+    dist = "Η κατανομή του διαθέσιμου έγινε με προτεραιότητα: **Δημόσιο → Εξασφαλισμένα → Λοιπά**."
+    end = "Το υπόλοιπο προς ρύθμιση ανά οφειλή είναι **Υπόλοιπο − Διαγραφή**, ενώ το ποσοστό κουρέματος **Διαγραφή / Υπόλοιπο**."
     return " ".join([line1, *parts, dist, end])
 
-def _html_css(case):
-    """Return (html, css) for WeasyPrint. Two-column summary + two-column debt cards + sticky footer."""
-    debts = case.get("debts", []) or []
-
-    # Summary (dl) two columns
-    summary_rows = [
-        ("Υπόθεση", case.get("case_id","")),
-        ("Οφειλέτης", case.get("borrower","")),
-        ("Ηλικία", str(case.get("debtor_age",""))),
-        ("Μέλη νοικοκυριού", f"{case.get('adults',0)}/{case.get('children',0)}"),
-        ("Συνολικό μηνιαίο εισόδημα", _fmt_eur(case.get("monthly_income",0))),
-        ("ΕΔΔ νοικοκυριού", _fmt_eur(case.get("edd_household",0))),
-        ("Πρόσθετες δαπάνες", _fmt_eur(case.get("extras_sum",0))),
-        ("Καθαρό διαθέσιμο", _fmt_eur(case.get("avail",0))),
-        ("Ακίνητη περιουσία", _fmt_eur(case.get("property_value",0))),
-        ("Ημερομηνία", case.get("predicted_at","")),
-    ]
-    summary_html = "".join([
-        f"""<div class="pair">
-               <div class="k">{k}</div>
-               <div class="v">{v}</div>
-            </div>"""
-        for k, v in summary_rows
-    ])
-
-    # Debts as cards (two columns, flow nicely, no squashed columns)
-    debt_cards = []
-    for d in debts:
-        secured_txt = "Ναι" if d.get("secured") else "Όχι"
-        coll_val = d.get("collateral_value", 0) if d.get("secured") else 0
-        card = f"""
-        <div class="debt-card">
-          <div class="debt-title">{d.get('creditor','')} — {d.get('loan_type','')}</div>
-          <dl>
-            <div><dt>Υπόλοιπο</dt><dd>{_fmt_eur(d.get('balance',0))}</dd></div>
-            <div><dt>Εξασφαλισμένο</dt><dd>{secured_txt}</dd></div>
-            <div><dt>Εξασφάλιση</dt><dd>{_fmt_eur(coll_val)}</dd></div>
-            <div><dt>Οροφή μηνών</dt><dd>{d.get('term_cap','')}</dd></div>
-            <div><dt>Πρόταση δόσης</dt><dd>{_fmt_eur(d.get('predicted_monthly',0))}</dd></div>
-            <div><dt>Διαγραφή</dt><dd>{_fmt_eur(d.get('predicted_writeoff',0))}</dd></div>
-            <div><dt>Υπόλοιπο ρύθμισης</dt><dd>{_fmt_eur(d.get('predicted_residual',0))}</dd></div>
-            <div><dt>Κούρεμα</dt><dd>{float(d.get('predicted_haircut_pct',0)):.1f}%</dd></div>
-          </dl>
-        </div>
-        """
-        debt_cards.append(card)
-    debts_html = "".join(debt_cards) if debt_cards else "<p class='muted'>Δεν δηλώθηκαν οφειλές.</p>"
-
-    html = f"""
-<!DOCTYPE html>
-<html lang="el">
-<head>
-  <meta charset="utf-8" />
-  <title>Bizboost – Πρόβλεψη</title>
-</head>
-<body>
-  <header class="header">
-    <div class="brand">
-      <div class="brand-top">The Bizboost</div>
-      <div class="brand-sub">by G. Dionysiou</div>
-    </div>
-    <div class="doc-title">Πρόβλεψη Ρύθμισης</div>
-  </header>
-
-  <main class="content">
-    <section class="card">
-      <h1>Στοιχεία Περίληψης</h1>
-      <div class="summary-grid">
-        {summary_html}
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Αναλυτικά ανά οφειλή (πρόβλεψη)</h2>
-      <div class="debt-grid">
-        {debts_html}
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Σκεπτικό πρότασης</h2>
-      <p class="reasoning">{_personalized_reasoning(case)}</p>
-    </section>
-  </main>
-
-  <footer class="footer" id="footer">
-    <div class="footer-line"></div>
-    <div class="footer-text">
-      {CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE}<br/>
-      {CONTACT_ADDRESS}
-    </div>
-  </footer>
-</body>
-</html>
-"""
-    css = """
-/* ----------- Page setup ----------- */
-@page {
-  size: A4;
-  margin: 20mm 16mm 26mm 16mm; /* extra bottom for footer */
-}
-html, body {
-  font-family: "Inter", "Noto Sans", system-ui, -apple-system, Arial, sans-serif;
-  color: #1a1a1a;
-  font-size: 10.5pt;
-  line-height: 1.45;
-}
-* { box-sizing: border-box; }
-
-/* ----------- Header ----------- */
-.header {
-  border-bottom: 1px solid #e6e9ef;
-  padding-bottom: 8pt;
-  margin-bottom: 12pt;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.brand {
-  display: flex;
-  flex-direction: column;
-  gap: 2pt;
-}
-.brand-top {
-  font-weight: 700;
-  letter-spacing: 0.6pt;
-  text-transform: uppercase;
-  color: #0F4C81;
-  font-size: 12pt;
-}
-.brand-sub {
-  color: #6b7280;
-  font-size: 9pt;
-}
-.doc-title {
-  font-size: 14pt;
-  font-weight: 700;
-  color: #0F4C81;
-}
-
-/* ----------- Content wrapper ----------- */
-.content {
-  display: block;
-}
-
-/* ----------- Cards ----------- */
-.card {
-  border: 1px solid #e6e9ef;
-  border-radius: 6pt;
-  padding: 10pt 12pt;
-  margin: 10pt 0;
-  background: #fff;
-}
-.card h1, .card h2 {
-  margin: 0 0 8pt 0;
-  color: #111827;
-}
-.card h1 { font-size: 12.5pt; }
-.card h2 { font-size: 11.5pt; }
-
-/* ----------- Summary grid (two columns) ----------- */
-.summary-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6pt 18pt;
-}
-.summary-grid .pair {
-  display: grid;
-  grid-template-columns: 1.1fr 1.4fr;
-  gap: 6pt;
-}
-.summary-grid .k {
-  color: #374151;
-  font-weight: 600;
-}
-.summary-grid .v {
-  color: #111827;
-  word-break: break-word;
-}
-
-/* ----------- Debts: two-column cards ----------- */
-.debt-grid {
-  columns: 2;            /* newspaper-style columns */
-  column-gap: 12pt;
-}
-.debt-card {
-  break-inside: avoid;   /* keep a card intact */
-  border: 1px solid #e6e9ef;
-  border-radius: 6pt;
-  margin: 0 0 10pt 0;   /* space after each card */
-  padding: 8pt 10pt;
-  background: #fafbfc;
-}
-.debt-title {
-  font-weight: 700;
-  color: #0F4C81;
-  margin-bottom: 6pt;
-}
-.debt-card dl {
-  display: grid;
-  grid-template-columns: 1.2fr 1.3fr;
-  gap: 4pt 10pt;
-}
-.debt-card dt {
-  color: #374151;
-  font-weight: 600;
-}
-.debt-card dd {
-  margin: 0;
-  color: #111827;
-  word-break: break-word;
-}
-
-/* ----------- Reasoning ----------- */
-.reasoning {
-  margin: 0;
-  color: #1f2937;
-}
-
-/* ----------- Footer (pinned bottom) ----------- */
-.footer {
-  position: fixed;
-  left: 0; right: 0; bottom: 0;
-  height: 22mm;            /* reserve height */
-  padding: 6pt 16mm 0 16mm;
-}
-.footer-line {
-  width: 100%;
-  border-top: 1px solid #e6e9ef;
-  margin-bottom: 6pt;
-}
-.footer-text {
-  text-align: center;
-  font-size: 9pt;
-  color: #6b7280;
-  line-height: 1.35;
-}
-
-/* ----------- Helpers ----------- */
-.muted { color: #6b7280; }
-"""
-    return html, css
-
 def make_pdf(case_dict:dict)->bytes:
-    """Render A4 PDF with clean layout using WeasyPrint (HTML+CSS)."""
-    # sanity default strings (avoid 'None' in fields)
-    for k in ["case_id","borrower","predicted_at"]:
-        if not case_dict.get(k):
-            case_dict[k] = ""
-    html, css = _html_css(case_dict)
-    try:
-        pdf = HTML(string=html, base_url=BASE_DIR).write_pdf(
-            stylesheets=[CSS(string=css)]
-        )
-        return pdf
-    except Exception as e:
-        raise RuntimeError(
-            "WeasyPrint failed. Ensure Homebrew libs (glib, cairo, pango, gdk-pixbuf, libffi, libxml2, libxslt) "
-            "are installed and `pip install weasyprint` ran in your venv. "
-            f"Original error: {e}"
-        )
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2.2*cm
+    )
+    styles = getSampleStyleSheet()
+    base_font = PDF_FONT
+    styles.add(ParagraphStyle(name="H1", fontName=base_font, fontSize=16, leading=20, spaceAfter=10, textColor=colors.HexColor("#0F4C81"), alignment=1))
+    styles.add(ParagraphStyle(name="H2", fontName=base_font, fontSize=12, leading=16, spaceAfter=6, textColor=colors.HexColor("#333333")))
+    styles.add(ParagraphStyle(name="P",  fontName=base_font, fontSize=10, leading=14))
+    styles.add(ParagraphStyle(name="SmallCenter", fontName=base_font, fontSize=8, leading=11, alignment=1, textColor=colors.HexColor("#666")))
+    styles.add(ParagraphStyle(name="Brand", fontName=base_font, fontSize=14, leading=18, textColor=colors.HexColor("#0F4C81"), alignment=1))
+
+    story = []
+
+    # Κεντραρισμένο λογότυπο ή εναλλακτικό brand-label
+    if os.path.exists(LOGO_PATH):
+        try:
+            img = Image(LOGO_PATH, width=150)  # περιορισμός πλάτους, ύψος auto
+            img.hAlign = 'CENTER'
+            story.append(img)
+            story.append(Spacer(1, 6))
+        except Exception:
+            story.append(Paragraph("The Bizboost by G. Dionysiou", styles["Brand"]))
+            story.append(Spacer(1, 6))
+    else:
+        story.append(Paragraph("The Bizboost by G. Dionysiou", styles["Brand"]))
+        story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Bizboost – Πρόβλεψη Ρύθμισης", styles["H1"]))
+
+    # Στοιχεία Περίληψης (2 στήλες table)
+    meta = [
+        ["Υπόθεση", case_dict.get("case_id","")],
+        ["Οφειλέτης", case_dict.get("borrower","")],
+        ["Ηλικία", str(case_dict.get("debtor_age",""))],
+        ["Μέλη νοικοκυριού (ενήλ./ανήλ.)", f"{case_dict.get('adults',0)}/{case_dict.get('children',0)}"],
+        ["Συνολικό μηνιαίο εισόδημα", f"{case_dict.get('monthly_income',0):,.2f} €"],
+        ["ΕΔΔ νοικοκυριού", f"{case_dict.get('edd_household',0):,.2f} €"],
+        ["Επιπλέον δαπάνες", f"{case_dict.get('extras_sum',0):,.2f} €"],
+        ["Καθαρό διαθέσιμο", f"{case_dict.get('avail',0):,.2f} €"],
+        ["Ακίνητη περιουσία", f"{case_dict.get('property_value',0):,.2f} €"],
+        ["Ημερομηνία", case_dict.get("predicted_at","")],
+    ]
+    meta_widths_cm = [6.0, 9.5]
+    t = Table(meta, colWidths=_cm_list_to_points(meta_widths_cm, doc))
+    t.setStyle(TableStyle([
+        ("FONT", (0,0), (-1,-1), base_font, 10),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#DDD")),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#AAA")),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F5F7FA")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FAFAFA")]),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING",(0,0), (-1,-1), 6),
+        ("TOPPADDING",(0,0), (-1,-1), 4),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 10))
+
+    # Αναλυτικά ανά οφειλή (πίνακας) – κλιμακωμένες στήλες
+    debts = case_dict.get("debts", [])
+    if debts:
+        story.append(Paragraph("Αναλυτικά ανά οφειλή (πρόβλεψη):", styles["H2"]))
+        rows = [["Πιστωτής","Είδος","Υπόλοιπο (€)","Εξασφαλ.","Εξασφάλιση (€)","Οροφή μηνών","Πρόταση δόσης (€)","Διαγραφή (€)","Υπόλοιπο Ρύθμισης (€)","Κούρεμα (%)"]]
+        for d in debts:
+            rows.append([
+                d.get("creditor",""),
+                d.get("loan_type",""),
+                f"{float(d.get('balance',0)):,.2f}",
+                "Ναι" if d.get("secured") else "Όχι",
+                f"{float(d.get('collateral_value',0)):,.2f}" if d.get("secured") else "0.00",
+                str(d.get("term_cap","")),
+                f"{float(d.get('predicted_monthly',0)):,.2f}",
+                f"{float(d.get('predicted_writeoff',0)):,.2f}",
+                f"{float(d.get('predicted_residual',0)):,.2f}",
+                f"{float(d.get('predicted_haircut_pct',0)):.1f}%",
+            ])
+        debt_widths_cm = [2.6, 2.1, 2.2, 1.0, 1.8, 1.6, 2.1, 2.1, 2.2, 1.1]
+        tt = Table(rows, colWidths=_cm_list_to_points(debt_widths_cm, doc), repeatRows=1)
+        tt.setStyle(TableStyle([
+            ("FONT", (0,0), (-1,-1), base_font, 9),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0F4C81")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("ALIGN", (2,1), (-1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#DDD")),
+            ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#0F4C81")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING",(0,0), (-1,-1), 4),
+        ]))
+        story.append(tt)
+        story.append(Spacer(1, 10))
+
+    # Προσωποποιημένο σκεπτικό
+    story.append(Paragraph("Σκεπτικό πρότασης", styles["H2"]))
+    story.append(Paragraph(_personalized_reasoning(case_dict), styles["P"]))
+    story.append(Spacer(1, 12))
+
+    # Footer (οριζόντια γραμμή + στοιχεία, σε table για αξιοπιστία) — κέντρο
+    footer_width = _available_width(doc)
+    footer_table = Table(
+        [[""]], colWidths=[footer_width]
+    )
+    footer_table.setStyle(TableStyle([
+        ("LINEABOVE", (0,0), (-1,0), 0.75, colors.HexColor("#DDD")),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+        ("TOPPADDING",(0,0),(-1,-1), 4),
+    ]))
+    story.append(footer_table)
+    footer_line1 = f"{CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE}"
+    footer_line2 = f"{CONTACT_ADDRESS}"
+    story.append(Paragraph(footer_line1, styles["SmallCenter"]))
+    story.append(Paragraph(footer_line2, styles["SmallCenter"]))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
 
 # ────────────────────────────── UI ──────────────────────────────
 st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost")
 page = st.sidebar.radio("Μενού", ["Νέα Πρόβλεψη", "Προβλέψεις & Πραγματικές Ρυθμίσεις"], index=0)
 df_all = load_data()
+
+# Train/load ML model once
+if ML_AVAILABLE:
+    ml_model = train_or_load_model(df_all)
+else:
+    st.sidebar.warning(f"ML not available: {ML_IMPORT_ERR}")
+
+# Optional: sidebar retrain
+with st.sidebar.expander("🤖 Machine Learning", expanded=False):
+    st.caption("Πιθανότητα αποδοχής ρύθμισης (Logistic Regression).")
+    if ML_AVAILABLE and st.button("Retrain acceptance model"):
+        try:
+            train_or_load_model.clear()
+            ml_model = train_or_load_model(load_data())
+            st.success("Model retrained.")
+        except Exception as e:
+            st.error(f"Retrain failed: {e}")
 
 # ────────────────────────────── ΝΕΑ ΠΡΟΒΛΕΨΗ ──────────────────────────────
 if page == "Νέα Πρόβλεψη":
@@ -636,6 +647,7 @@ if page == "Νέα Πρόβλεψη":
     if submitted:
         # Συνοφειλέτες -> λίστα αντικειμένων
         codebtors = codebtors_df.fillna(0).to_dict(orient="records")
+        # Υπολογισμός μηνιαίου εισοδήματος & ΕΔΔ συνοφειλετών
         monthly_income_codes = 0.0
         edd_codes = 0.0
         for c in codebtors:
@@ -649,9 +661,6 @@ if page == "Νέα Πρόβλεψη":
 
         # Συγκεντρωτικά / οφειλές
         debts = debts_df.fillna(0).to_dict(orient="records")
-        total_debt  = sum([float(d["balance"] or 0) for d in debts])
-        secured_amt = sum([float(d["collateral_value"] or 0) for d in debts if d.get("secured")])
-
         extras_sum = (extra_medical or 0) + (extra_students or 0) + (extra_legal or 0)
         avail = available_income(monthly_income, edd_total_house, extra_medical, extra_students, extra_legal)
         age_cap_months = months_cap_from_age(int(debtor_age))
@@ -706,6 +715,26 @@ if page == "Νέα Πρόβλεψη":
         st.dataframe(pd.DataFrame(per_debt_rows), use_container_width=True)
         st.info("Κατανομή διαθέσιμου: Δημόσιο → Εξασφαλισμένα → Λοιπά (προτεραιότητα).")
 
+        # ML probability
+        prob_accept = None
+        if ML_AVAILABLE:
+            try:
+                case_for_ml = {
+                    "debtor_age": int(debtor_age),
+                    "adults": int(adults),
+                    "children": int(children),
+                    "monthly_income": float(monthly_income),
+                    "property_value": float(property_value),
+                    "debts": debts_to_store
+                }
+                X_one = build_features_for_one(case_for_ml)
+                prob_accept = float(ml_model.predict_proba(X_one)[0,1])
+                st.metric("🔮 Πιθανότητα αποδοχής ρύθμισης", f"{prob_accept*100:.1f}%")
+            except Exception as e:
+                st.warning(f"ML prediction unavailable: {e}")
+        else:
+            st.info("🔮 ML module not installed in this environment.")
+
         # Αποθήκευση
         case_id = f"CASE-{uuid.uuid4().hex[:8].upper()}"
         now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -732,7 +761,7 @@ if page == "Νέα Πρόβλεψη":
             "predicted_at": now_str,
             "predicted_monthly": None,
             "predicted_haircut_pct": None,
-            "prob_accept": None,
+            "prob_accept": float(prob_accept) if prob_accept is not None else None,
             "real_monthly": None,
             "real_haircut_pct": None,
             "accepted": None,
@@ -770,11 +799,12 @@ if page == "Νέα Πρόβλεψη":
 # ─────────────────────── ΠΡΟΒΛΕΨΕΙΣ & ΠΡΑΓΜΑΤΙΚΕΣ ΡΥΘΜΙΣΕΙΣ ───────────────────────
 else:
     st.title("📁 Προβλέψεις & Πραγματικές Ρυθμίσεις")
+    df_all = load_data()
     if df_all.empty:
         st.info("Δεν υπάρχουν ακόμα υποθέσεις.")
     else:
         dfv = df_all.copy()
-        dfv = dfv[["case_id","borrower","predicted_at"]].sort_values("predicted_at", ascending=False)
+        dfv = dfv[["case_id","borrower","predicted_at","prob_accept"]].sort_values("predicted_at", ascending=False)
         st.dataframe(dfv, use_container_width=True, hide_index=True)
 
         st.markdown("---")
@@ -789,7 +819,11 @@ else:
             except Exception:
                 debts = []
 
-            st.write(f"**Οφειλέτης:** {row.get('borrower','')}  |  **Ημερομηνία πρόβλεψης:** {row.get('predicted_at','')}")
+            st.write(
+                f"**Οφειλέτης:** {row.get('borrower','')}  |  **Ημερομηνία πρόβλεψης:** {row.get('predicted_at','')}"
+                + (f"  |  **🔮 Πιθανότητα αποδοχής:** {float(row.get('prob_accept'))*100:.1f}%"
+                   if row.get("prob_accept") is not None else "")
+            )
 
             st.markdown("#### Πραγματική ρύθμιση ανά οφειλή")
             real_list = []
