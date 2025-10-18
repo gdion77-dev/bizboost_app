@@ -2,7 +2,11 @@
 # Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF)
 # - Ελληνικό UI
 # - Supabase Postgres μέσω SQLAlchemy + psycopg v3
-# - PDF via WeasyPrint (HTML/CSS) – modern layout, 2-column sections, sticky footer
+# - PDF (WeasyPrint HTML/CSS) με καθαρό, επαγγελματικό layout:
+#   • Header label ("The Bizboost by G. Dionysiou") — no logo image required
+#   • Περίληψη σε 2 στήλες (dl)
+#   • Οφειλές σε 2 στήλες "cards" (dl ανά οφειλή, χωρίς στριμώγματα)
+#   • Footer pinned στο κάτω μέρος κάθε σελίδας με στοιχεία επικοινωνίας
 # - Συνοφειλέτες: annual_income (ετήσιο) -> monthly, αφαίρεση ΕΔΔ ανά συνοφειλέτη
 # - Κανόνες εξωδικαστικού: ΑΑΔΕ/ΕΦΚΑ 240μήνες, Τράπεζες/Servicers 420μήνες, κόφτης ηλικίας
 # - Κατανομή διαθέσιμου: Δημόσιο -> Εξασφαλισμένα -> Λοιπά (priority)
@@ -12,21 +16,18 @@ import os, io, json, uuid, datetime as dt
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 from sqlalchemy import create_engine, text
 
 # PDF (WeasyPrint)
-# NOTE: We lazy-import WeasyPrint inside make_pdf() so the app runs even if libs not installed yet.
-# from weasyprint import HTML, CSS  # <-- do NOT import here
+from weasyprint import HTML, CSS
 
 # ────────────────────────────── UI / PATHS ──────────────────────────────
 st.set_page_config(page_title="Bizboost - Εξωδικαστικός", page_icon="💠", layout="wide")
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(BASE_DIR, "logo.png")            # (unused in new header label, kept for future)
-DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")           # optional initial import
-FONT_DIR  = os.path.join(BASE_DIR, "assets", "fonts")
-NOTO_SANS = os.path.join(FONT_DIR, "NotoSans-Regular.ttf")
-NOTO_SERIF= os.path.join(FONT_DIR, "NotoSerif-Regular.ttf")
+LOGO_PATH = os.path.join(BASE_DIR, "logo.png")  # (δεν απαιτείται πλέον, κρατάμε για μελλοντική χρήση)
+DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")  # προαιρετικό αρχικό import
 
 # ────────────────────────────── ΠΑΡΑΜΕΤΡΟΙ ΠΟΛΙΤΙΚΗΣ ──────────────────────────────
 PUBLIC_CREDITORS = {"ΑΑΔΕ", "ΕΦΚΑ"}
@@ -41,7 +42,7 @@ POLICY = {
     "priority": ["PUBLIC", "SECURED", "UNSECURED"],  # σειρά εξυπηρέτησης
     "term_caps": {"PUBLIC": 240, "BANK": 420, "DEFAULT": 240},
     "allocate": "priority_first",  # "priority_first" ή "proportional"
-    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},
+    "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},  # π.χ. 0.4 για 40%
 }
 
 # ─────────────────────── ΕΔΔ & ΔΙΑΘΕΣΙΜΑ ───────────────────────
@@ -253,14 +254,19 @@ def load_data():
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 
-# ────────────────────────────── PDF (HTML/CSS) ──────────────────────────────
+# ────────────────────────────── PDF: HTML + CSS (WeasyPrint) ──────────────────────────────
+
 CONTACT_NAME    = "Γεώργιος Φ. Διονυσίου Οικονομολόγος BA, MSc"
 CONTACT_PHONE   = "+30 2273081618"
 CONTACT_EMAIL   = "info@bizboost.gr"
 CONTACT_SITE    = "www.bizboost.gr"
 CONTACT_ADDRESS = "Αγίου Νικολάου 1, Σάμος 83100"
 
-ACCENT = "#0F4C81"
+def _fmt_eur(x):
+    try:
+        return f"{float(x):,.2f} €"
+    except:
+        return str(x)
 
 def _personalized_reasoning(case_dict):
     mi   = float(case_dict.get("monthly_income",0) or 0)
@@ -281,241 +287,280 @@ def _personalized_reasoning(case_dict):
     parts = []
     if public_cnt:
         cap_info = f"με όριο {max(public_terms) if public_terms else 240} μήνες" if public_terms else "έως 240 μήνες"
-        parts.append(f"Για το Δημόσιο (ΑΑΔΕ/ΕΦΚΑ, {public_cnt}) χρησιμοποιήθηκε μέγιστη διάρκεια {cap_info}.")
+        parts.append(f"Για τις απαιτήσεις Δημοσίου (ΑΑΔΕ/ΕΦΚΑ, {public_cnt} οφειλή/ές) χρησιμοποιήθηκε μέγιστη διάρκεια {cap_info}.")
     if secured_cnt:
         parts.append("Για τις εξασφαλισμένες οφειλές ελήφθη υπόψη η εξασφάλιση (security floor).")
     if other_cnt:
         cap_bank = f"{max(bank_terms)} μήνες" if bank_terms else "έως 420 μήνες"
         parts.append(f"Για τις λοιπές τραπεζικές/servicers οφειλές εφαρμόστηκε μέγιστη διάρκεια {cap_bank}.")
     dist = "Η κατανομή του διαθέσιμου έγινε με προτεραιότητα: Δημόσιο → Εξασφαλισμένα → Λοιπά."
-    end = "Το υπόλοιπο ρύθμισης ανά οφειλή: Υπόλοιπο − Διαγραφή. Ποσοστό κουρέματος: Διαγραφή / Υπόλοιπο."
+    end = "Το υπόλοιπο ρύθμισης ανά οφειλή είναι Υπόλοιπο − Διαγραφή και το ποσοστό κουρέματος είναι Διαγραφή / Υπόλοιπο."
     return " ".join([line1, *parts, dist, end])
 
-def _font_face_css():
-    parts = []
-    if os.path.exists(NOTO_SANS):
-        parts.append(f"""
-        @font-face {{
-            font-family: 'NotoSansLocal';
-            src: url('file://{NOTO_SANS}') format('truetype');
-            font-weight: normal; font-style: normal; font-display: swap;
-        }}
-        """)
-        family = "NotoSansLocal, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-    else:
-        family = "-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-    return "\n".join(parts), family
-
-def render_prediction_html(case: dict) -> str:
-    fontface, family = _font_face_css()
+def _html_css(case):
+    """Return (html, css) for WeasyPrint. Two-column summary + two-column debt cards + sticky footer."""
     debts = case.get("debts", []) or []
 
-    # Build debt cards (two-column responsive grid)
-    debt_cards_html = ""
-    for d in debts:
-        creditor = d.get("creditor","")
-        loan     = d.get("loan_type","")
-        bal      = f"{float(d.get('balance',0)):,.2f} €"
-        secured  = "Ναι" if d.get("secured") else "Όχι"
-        collat   = f"{float(d.get('collateral_value',0)):,.2f} €" if d.get("secured") else "—"
-        term     = str(d.get("term_cap",""))
-        pm       = f"{float(d.get('predicted_monthly',0)):,.2f} €"
-        wr       = f"{float(d.get('predicted_writeoff',0)):,.2f} €"
-        resid    = f"{float(d.get('predicted_residual',0)):,.2f} €"
-        hc       = f"{float(d.get('predicted_haircut_pct',0)):.1f}%"
-        debt_cards_html += f"""
-        <div class="card">
-          <div class="card-title">{creditor}</div>
-          <div class="kv">
-            <div>Είδος</div><div>{loan}</div>
-            <div>Υπόλοιπο</div><div>{bal}</div>
-            <div>Εξασφαλ.</div><div>{secured}</div>
-            <div>Εξασφάλιση</div><div>{collat}</div>
-            <div>Οροφή μηνών</div><div>{term}</div>
-            <div>Πρόταση δόσης</div><div>{pm}</div>
-            <div>Διαγραφή</div><div>{wr}</div>
-            <div>Υπόλοιπο ρύθμισης</div><div>{resid}</div>
-            <div>Κούρεμα</div><div>{hc}</div>
-          </div>
-        </div>
-        """
-
-    # Summary (two columns: labels vs values)
+    # Summary (dl) two columns
     summary_rows = [
         ("Υπόθεση", case.get("case_id","")),
         ("Οφειλέτης", case.get("borrower","")),
         ("Ηλικία", str(case.get("debtor_age",""))),
         ("Μέλη νοικοκυριού", f"{case.get('adults',0)}/{case.get('children',0)}"),
-        ("Συνολικό μηνιαίο εισόδημα", f"{case.get('monthly_income',0):,.2f} €"),
-        ("ΕΔΔ νοικοκυριού", f"{case.get('edd_household',0):,.2f} €"),
-        ("Επιπλέον δαπάνες", f"{case.get('extras_sum',0):,.2f} €"),
-        ("Καθαρό διαθέσιμο", f"{case.get('avail',0):,.2f} €"),
-        ("Ακίνητη περιουσία", f"{case.get('property_value',0):,.2f} €"),
+        ("Συνολικό μηνιαίο εισόδημα", _fmt_eur(case.get("monthly_income",0))),
+        ("ΕΔΔ νοικοκυριού", _fmt_eur(case.get("edd_household",0))),
+        ("Πρόσθετες δαπάνες", _fmt_eur(case.get("extras_sum",0))),
+        ("Καθαρό διαθέσιμο", _fmt_eur(case.get("avail",0))),
+        ("Ακίνητη περιουσία", _fmt_eur(case.get("property_value",0))),
         ("Ημερομηνία", case.get("predicted_at","")),
     ]
-    summary_html = "".join([f"<div class='row'><div>{k}</div><div>{v}</div></div>" for k,v in summary_rows])
+    summary_html = "".join([
+        f"""<div class="pair">
+               <div class="k">{k}</div>
+               <div class="v">{v}</div>
+            </div>"""
+        for k, v in summary_rows
+    ])
 
-    reasoning = _personalized_reasoning(case)
+    # Debts as cards (two columns, flow nicely, no squashed columns)
+    debt_cards = []
+    for d in debts:
+        secured_txt = "Ναι" if d.get("secured") else "Όχι"
+        coll_val = d.get("collateral_value", 0) if d.get("secured") else 0
+        card = f"""
+        <div class="debt-card">
+          <div class="debt-title">{d.get('creditor','')} — {d.get('loan_type','')}</div>
+          <dl>
+            <div><dt>Υπόλοιπο</dt><dd>{_fmt_eur(d.get('balance',0))}</dd></div>
+            <div><dt>Εξασφαλισμένο</dt><dd>{secured_txt}</dd></div>
+            <div><dt>Εξασφάλιση</dt><dd>{_fmt_eur(coll_val)}</dd></div>
+            <div><dt>Οροφή μηνών</dt><dd>{d.get('term_cap','')}</dd></div>
+            <div><dt>Πρόταση δόσης</dt><dd>{_fmt_eur(d.get('predicted_monthly',0))}</dd></div>
+            <div><dt>Διαγραφή</dt><dd>{_fmt_eur(d.get('predicted_writeoff',0))}</dd></div>
+            <div><dt>Υπόλοιπο ρύθμισης</dt><dd>{_fmt_eur(d.get('predicted_residual',0))}</dd></div>
+            <div><dt>Κούρεμα</dt><dd>{float(d.get('predicted_haircut_pct',0)):.1f}%</dd></div>
+          </dl>
+        </div>
+        """
+        debt_cards.append(card)
+    debts_html = "".join(debt_cards) if debt_cards else "<p class='muted'>Δεν δηλώθηκαν οφειλές.</p>"
 
     html = f"""
 <!DOCTYPE html>
 <html lang="el">
 <head>
-<meta charset="UTF-8">
-<title>Bizboost – Πρόβλεψη</title>
-<style>
-{fontface}
-:root {{
-  --bg: #F6F8FB;
-  --card: #FFFFFF;
-  --text: #1F2937;
-  --muted: #6B7280;
-  --line: #E5E7EB;
-  --accent: {ACCENT};
-}}
-* {{ box-sizing: border-box; }}
-html, body {{
-  margin: 0; padding: 0;
-  font-family: {family};
-  color: var(--text);
-}}
-.wrapper {{
-  background: var(--bg);
-  min-height: 100vh;
-  display: flex; flex-direction: column;
-}}
-.container {{
-  width: 780px; margin: 24px auto 96px;  /* leave space for sticky footer */
-}}
-.header {{
-  text-align: center;
-  margin-bottom: 16px;
-}}
-.brand {{
-  display: inline-block;
-  padding: 10px 16px;
-  font-weight: 700; font-size: 18px;
-  color: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-  letter-spacing: .6px;
-}}
-.h1 {{
-  margin: 10px 0 16px;
-  font-size: 20px;
-  color: var(--accent);
-  text-align: center;
-}}
-.card {{
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 14px 16px;
-  box-shadow: 0 2px 8px rgba(15,76,129,0.06);
-}}
-.section {{ margin-top: 14px; }}
-.section-title {{
-  font-size: 13px; font-weight: 700; color: var(--muted);
-  letter-spacing: .4px; text-transform: uppercase;
-  margin: 0 0 8px;
-}}
-.summary {{
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-}}
-.summary .row {{
-  display: grid; grid-template-columns: 1.2fr 1.8fr;
-  gap: 10px; align-items: center;
-  border-bottom: 1px dashed var(--line);
-  padding: 6px 0;
-}}
-.summary .row:last-child {{ border-bottom: 0; }}
-.summary .row > div:first-child {{ color: var(--muted); font-size: 12px; }}
-.summary .row > div:last-child {{ font-weight: 600; font-size: 12px; }}
-
-.debts-grid {{
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px;
-}}
-.card-title {{
-  font-weight: 700; color: var(--accent); margin-bottom: 6px; font-size: 13px;
-}}
-.kv {{
-  display: grid; grid-template-columns: 1.2fr 1.8fr; gap: 8px;
-  font-size: 12px;
-}}
-.kv > div:nth-child(2n-1) {{ color: var(--muted); }}
-.kv > div:nth-child(2n)   {{ font-weight: 600; }}
-
-.reason {{
-  font-size: 12px; line-height: 1.6; color: var(--text);
-}}
-.footer {{
-  position: fixed; left: 0; right: 0; bottom: 0;
-  border-top: 1px solid var(--line);
-  background: #fff;
-  padding: 8px 20px;
-  font-size: 10px; color: var(--muted);
-}}
-.footer .inner {{ width: 780px; margin: 0 auto; text-align: center; }}
-.smallmuted {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
-</style>
+  <meta charset="utf-8" />
+  <title>Bizboost – Πρόβλεψη</title>
 </head>
 <body>
-<div class="wrapper">
-  <div class="container">
-    <div class="header">
-      <div class="brand">The Bizboost by G. Dionysiou</div>
-      <div class="h1">Πρόβλεψη Ρύθμισης (Εξωδικαστικός)</div>
+  <header class="header">
+    <div class="brand">
+      <div class="brand-top">The Bizboost</div>
+      <div class="brand-sub">by G. Dionysiou</div>
     </div>
+    <div class="doc-title">Πρόβλεψη Ρύθμισης</div>
+  </header>
 
-    <div class="section card">
-      <div class="section-title">Στοιχεία Περίληψης</div>
-      <div class="summary">
+  <main class="content">
+    <section class="card">
+      <h1>Στοιχεία Περίληψης</h1>
+      <div class="summary-grid">
         {summary_html}
       </div>
+    </section>
+
+    <section class="card">
+      <h2>Αναλυτικά ανά οφειλή (πρόβλεψη)</h2>
+      <div class="debt-grid">
+        {debts_html}
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Σκεπτικό πρότασης</h2>
+      <p class="reasoning">{_personalized_reasoning(case)}</p>
+    </section>
+  </main>
+
+  <footer class="footer" id="footer">
+    <div class="footer-line"></div>
+    <div class="footer-text">
+      {CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE}<br/>
+      {CONTACT_ADDRESS}
     </div>
-
-    {"<div class='section card'><div class='section-title'>Αναλυτικά ανά οφειλή (πρόβλεψη)</div><div class='debts-grid'>" if debts else ""}
-      {debt_cards_html}
-    {"</div></div>" if debts else ""}
-
-    <div class="section card">
-      <div class="section-title">Σκεπτικό πρότασης</div>
-      <div class="reason">{reasoning}</div>
-    </div>
-
-    <div class="smallmuted">Έγγραφο δημιουργήθηκε αυτόματα από την εφαρμογή Bizboost.</div>
-  </div>
-
-  <div class="footer">
-    <div class="inner">
-      {CONTACT_NAME} • Τ: {CONTACT_PHONE} • E: {CONTACT_EMAIL} • {CONTACT_SITE} • {CONTACT_ADDRESS}
-    </div>
-  </div>
-</div>
+  </footer>
 </body>
 </html>
 """
-    return html
+    css = """
+/* ----------- Page setup ----------- */
+@page {
+  size: A4;
+  margin: 20mm 16mm 26mm 16mm; /* extra bottom for footer */
+}
+html, body {
+  font-family: "Inter", "Noto Sans", system-ui, -apple-system, Arial, sans-serif;
+  color: #1a1a1a;
+  font-size: 10.5pt;
+  line-height: 1.45;
+}
+* { box-sizing: border-box; }
 
-def make_pdf(case_dict: dict) -> bytes:
-    # Lazy import so the app can still start if WeasyPrint libs aren’t installed yet
+/* ----------- Header ----------- */
+.header {
+  border-bottom: 1px solid #e6e9ef;
+  padding-bottom: 8pt;
+  margin-bottom: 12pt;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2pt;
+}
+.brand-top {
+  font-weight: 700;
+  letter-spacing: 0.6pt;
+  text-transform: uppercase;
+  color: #0F4C81;
+  font-size: 12pt;
+}
+.brand-sub {
+  color: #6b7280;
+  font-size: 9pt;
+}
+.doc-title {
+  font-size: 14pt;
+  font-weight: 700;
+  color: #0F4C81;
+}
+
+/* ----------- Content wrapper ----------- */
+.content {
+  display: block;
+}
+
+/* ----------- Cards ----------- */
+.card {
+  border: 1px solid #e6e9ef;
+  border-radius: 6pt;
+  padding: 10pt 12pt;
+  margin: 10pt 0;
+  background: #fff;
+}
+.card h1, .card h2 {
+  margin: 0 0 8pt 0;
+  color: #111827;
+}
+.card h1 { font-size: 12.5pt; }
+.card h2 { font-size: 11.5pt; }
+
+/* ----------- Summary grid (two columns) ----------- */
+.summary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6pt 18pt;
+}
+.summary-grid .pair {
+  display: grid;
+  grid-template-columns: 1.1fr 1.4fr;
+  gap: 6pt;
+}
+.summary-grid .k {
+  color: #374151;
+  font-weight: 600;
+}
+.summary-grid .v {
+  color: #111827;
+  word-break: break-word;
+}
+
+/* ----------- Debts: two-column cards ----------- */
+.debt-grid {
+  columns: 2;            /* newspaper-style columns */
+  column-gap: 12pt;
+}
+.debt-card {
+  break-inside: avoid;   /* keep a card intact */
+  border: 1px solid #e6e9ef;
+  border-radius: 6pt;
+  margin: 0 0 10pt 0;   /* space after each card */
+  padding: 8pt 10pt;
+  background: #fafbfc;
+}
+.debt-title {
+  font-weight: 700;
+  color: #0F4C81;
+  margin-bottom: 6pt;
+}
+.debt-card dl {
+  display: grid;
+  grid-template-columns: 1.2fr 1.3fr;
+  gap: 4pt 10pt;
+}
+.debt-card dt {
+  color: #374151;
+  font-weight: 600;
+}
+.debt-card dd {
+  margin: 0;
+  color: #111827;
+  word-break: break-word;
+}
+
+/* ----------- Reasoning ----------- */
+.reasoning {
+  margin: 0;
+  color: #1f2937;
+}
+
+/* ----------- Footer (pinned bottom) ----------- */
+.footer {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  height: 22mm;            /* reserve height */
+  padding: 6pt 16mm 0 16mm;
+}
+.footer-line {
+  width: 100%;
+  border-top: 1px solid #e6e9ef;
+  margin-bottom: 6pt;
+}
+.footer-text {
+  text-align: center;
+  font-size: 9pt;
+  color: #6b7280;
+  line-height: 1.35;
+}
+
+/* ----------- Helpers ----------- */
+.muted { color: #6b7280; }
+"""
+    return html, css
+
+def make_pdf(case_dict:dict)->bytes:
+    """Render A4 PDF with clean layout using WeasyPrint (HTML+CSS)."""
+    # sanity default strings (avoid 'None' in fields)
+    for k in ["case_id","borrower","predicted_at"]:
+        if not case_dict.get(k):
+            case_dict[k] = ""
+    html, css = _html_css(case_dict)
     try:
-        from weasyprint import HTML
+        pdf = HTML(string=html, base_url=BASE_DIR).write_pdf(
+            stylesheets=[CSS(string=css)]
+        )
+        return pdf
     except Exception as e:
         raise RuntimeError(
-            "WeasyPrint is not available. Install system libs with Homebrew:\n"
-            "brew install glib cairo pango gdk-pixbuf libffi libxml2 libxslt\n"
-            "then `pip install weasyprint` inside your venv.\n\n"
+            "WeasyPrint failed. Ensure Homebrew libs (glib, cairo, pango, gdk-pixbuf, libffi, libxml2, libxslt) "
+            "are installed and `pip install weasyprint` ran in your venv. "
             f"Original error: {e}"
         )
-    html = render_prediction_html(case_dict)
-    pdf_bytes = HTML(string=html, base_url=BASE_DIR).write_pdf()
-    return pdf_bytes
 
 # ────────────────────────────── UI ──────────────────────────────
-st.sidebar.caption("Bizboost")
+st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost")
 page = st.sidebar.radio("Μενού", ["Νέα Πρόβλεψη", "Προβλέψεις & Πραγματικές Ρυθμίσεις"], index=0)
 df_all = load_data()
 
@@ -589,7 +634,7 @@ if page == "Νέα Πρόβλεψη":
         submitted = st.form_submit_button("Υπολογισμός Πρόβλεψης & Αποθήκευση", use_container_width=True)
 
     if submitted:
-        # Συνοφειλέτες
+        # Συνοφειλέτες -> λίστα αντικειμένων
         codebtors = codebtors_df.fillna(0).to_dict(orient="records")
         monthly_income_codes = 0.0
         edd_codes = 0.0
@@ -602,12 +647,16 @@ if page == "Νέα Πρόβλεψη":
         monthly_income = float(monthly_income_main + monthly_income_codes)
         edd_total_house = float(edd_val + edd_codes)
 
+        # Συγκεντρωτικά / οφειλές
         debts = debts_df.fillna(0).to_dict(orient="records")
+        total_debt  = sum([float(d["balance"] or 0) for d in debts])
+        secured_amt = sum([float(d["collateral_value"] or 0) for d in debts if d.get("secured")])
+
         extras_sum = (extra_medical or 0) + (extra_students or 0) + (extra_legal or 0)
         avail = available_income(monthly_income, edd_total_house, extra_medical, extra_students, extra_legal)
         age_cap_months = months_cap_from_age(int(debtor_age))
 
-        # Εμπλουτισμός οφειλών
+        # Εμπλουτισμός οφειλών για κανόνες
         enriched = []
         for d in debts:
             enriched.append({
@@ -620,8 +669,7 @@ if page == "Νέα Πρόβλεψη":
             })
 
         # Κατανομή διαθέσιμου
-        shares = split_available_priority(avail, enriched) if POLICY["allocate"]=="priority_first" \
-                 else split_available_proportional(avail, enriched)
+        shares = split_available_priority(avail, enriched) if POLICY["allocate"]=="priority_first" else split_available_proportional(avail, enriched)
 
         # Υπολογισμός ανά οφειλή
         per_debt_rows = []
