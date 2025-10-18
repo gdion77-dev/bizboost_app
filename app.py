@@ -441,7 +441,11 @@ if "confirm_delete" not in st.session_state:
     st.session_state.confirm_delete = None
 
 # ────────────────────────────── UI ──────────────────────────────
-st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost") if os.path.exists(LOGO_PATH) else st.sidebar.markdown("**Bizboost**")
+if os.path.exists(LOGO_PATH):
+    st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost")
+else:
+    st.sidebar.markdown("**Bizboost**")
+
 page = st.sidebar.radio("Μενού", ["Νέα Πρόβλεψη", "Προβλέψεις & Πραγματικές Ρυθμίσεις"], index=0)
 df_all = load_data()
 
