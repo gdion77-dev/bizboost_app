@@ -282,6 +282,21 @@ def load_data():
 
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
+def delete_case_db(case_id: str):
+    """Delete a case by ID."""
+    engine = get_db_engine()
+    init_db(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM cases WHERE case_id = :cid"), {"cid": case_id})
+
+def load_case_by_id(case_id: str) -> dict | None:
+    """Load a single case row as dict by ID."""
+    engine = get_db_engine()
+    init_db(engine)
+    with engine.begin() as conn:
+        res = conn.execute(text("SELECT * FROM cases WHERE case_id = :cid"), {"cid": case_id}).mappings().fetchone()
+    return dict(res) if res else None
+
 
 # ────────────────────────────── PDF EXPORT (βελτιωμένο) ──────────────────────────────
 CONTACT_NAME   = "Γεώργιος Φ. Διονυσίου Οικονομολόγος BA, MSc"
@@ -726,154 +741,115 @@ if page == "Νέα Πρόβλεψη":
 else:
     st.title("📁 Προβλέψεις & Πραγματικές Ρυθμίσεις")
 
-    # Κρατάμε ποια υπόθεση είναι «ανοιχτή»
     if "open_case_id" not in st.session_state:
         st.session_state.open_case_id = None
 
+    df_all = load_data()
     if df_all.empty:
         st.info("Δεν υπάρχουν ακόμα υποθέσεις.")
-    else:
-        # Μικρό grid με κουμπιά Άνοιγμα/Διαγραφή
-        st.subheader("Λίστα υποθέσεων")
+        st.stop()
 
-        # Ταξινόμηση/προβολή
-        dfv = df_all[["case_id","borrower","predicted_at"]].copy()
-        dfv = dfv.sort_values("predicted_at", ascending=False)
+    # Επιλογή υπόθεσης
+    dfv = df_all.copy()
+    dfv = dfv[["case_id","borrower","predicted_at"]].sort_values("predicted_at", ascending=False)
+    st.dataframe(dfv, use_container_width=True, hide_index=True)
 
-        # Επικεφαλίδες
-        hc1, hc2, hc3, hc4, hc5 = st.columns([2,3,3,2,2])
-        hc1.markdown("**Υπόθεση**")
-        hc2.markdown("**Οφειλέτης**")
-        hc3.markdown("**Ημ/νία πρόβλεψης**")
-        hc4.markdown("**Ενέργεια**")
-        hc5.markdown("**Διαγραφή**")
+    st.markdown("---")
+    st.subheader("Άνοιγμα ή Διαγραφή υπόθεσης")
 
-        for _, r in dfv.iterrows():
-            c1, c2, c3, c4, c5 = st.columns([2,3,3,2,2])
-            c1.write(r["case_id"])
-            c2.write(r["borrower"])
-            c3.write(r["predicted_at"] or "")
+    col_pick, col_btn_open, col_btn_delete = st.columns([3,1,1])
+    case_ids = df_all["case_id"].tolist()
+    pick = col_pick.selectbox("Διάλεξε Υπόθεση", case_ids, key="case_picker")
 
-            # Κουμπί Άνοιγμα: γράφει το case_id στο session_state
-            if c4.button("Άνοιγμα", key=f"open_{r['case_id']}"):
-                st.session_state.open_case_id = r["case_id"]
+    # OPEN: Θυμόμαστε ποια υπόθεση άνοιξε, ώστε στο rerun να τη δείξουμε
+    if col_btn_open.button("🔓 Άνοιγμα", type="primary", use_container_width=True, key="btn_open_case"):
+        st.session_state.open_case_id = pick
+        st.experimental_rerun()
 
-            # Κουμπί Διαγραφή: αφαιρούμε μόνιμα από τη ΒΔ
-            if c5.button("🗑️ Διαγραφή", key=f"del_{r['case_id']}"):
-                try:
-                    engine = get_db_engine()
-                    with engine.begin() as conn:
-                        conn.execute(
-                            text("DELETE FROM cases WHERE case_id = :cid"),
-                            {"cid": r["case_id"]}
-                        )
-                    # Αν σβήσαμε την «ανοιχτή» υπόθεση, καθάρισε τη μνήμη
-                    if st.session_state.open_case_id == r["case_id"]:
-                        st.session_state.open_case_id = None
-                    st.success(f"Διαγράφηκε η υπόθεση {r['case_id']}.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Αποτυχία διαγραφής: {e}")
+    # DELETE: Διαγράφει από DB και καθαρίζει state
+    if col_btn_delete.button("🗑️ Διαγραφή", use_container_width=True, key="btn_delete_case"):
+        delete_case_db(pick)
+        st.session_state.open_case_id = None
+        st.success(f"Διαγράφηκε η υπόθεση {pick}")
+        st.experimental_rerun()
 
-        st.markdown("---")
+    # Αν υπάρχει ανοιχτή υπόθεση, δείξε την φόρμα πραγματικής ρύθμισης
+    open_id = st.session_state.open_case_id
+    if not open_id:
+        st.info("Πάτησε **Άνοιγμα** για να επεξεργαστείς την υπόθεση.")
+        st.stop()
 
-        # Αν έχει επιλεγεί υπόθεση για άνοιγμα, δείξε την καρτέλα πραγματικής ρύθμισης
-        open_id = st.session_state.open_case_id
-        if open_id:
-            st.subheader(f"Άνοιγμα υπόθεσης: {open_id}")
+    row = load_case_by_id(open_id)
+    if not row:
+        st.warning("Η υπόθεση δεν βρέθηκε (ίσως διαγράφηκε).")
+        st.session_state.open_case_id = None
+        st.stop()
 
-            row = df_all[df_all["case_id"] == open_id]
-            if row.empty:
-                st.warning("Η υπόθεση δεν βρέθηκε (ίσως διαγράφηκε).")
-            else:
-                row = row.iloc[0].to_dict()
-                try:
-                    debts = json.loads(row.get("debts_json") or "[]")
-                except Exception:
-                    debts = []
+    st.markdown(f"**Υπόθεση:** `{row.get('case_id','')}`  —  **Οφειλέτης:** {row.get('borrower','')}  —  **Πρόβλεψη στις:** {row.get('predicted_at','')}")
 
-                st.write(f"**Οφειλέτης:** {row.get('borrower','')}  |  **Ημερομηνία πρόβλεψης:** {row.get('predicted_at','')}")
+    try:
+        predicted_debts = json.loads(row.get("debts_json") or "[]")
+    except Exception:
+        predicted_debts = []
 
-                st.markdown("#### Πραγματική ρύθμιση ανά οφειλή")
-                real_list = []
-                for i, d in enumerate(debts):
-                    with st.expander(
-                        f"Οφειλή #{i+1} – {d.get('creditor','')} / {d.get('loan_type','')} / Υπόλοιπο: {float(d.get('balance',0)):,.2f} €",
-                        expanded=True if i == 0 else False
-                    ):
-                        col1, col2, col3, col4 = st.columns(4)
-                        real_term    = col1.number_input(
-                            "Πραγμ. μήνες", 0, 1200, int(row.get("real_term_months") or 0),
-                            key=f"rt_{open_id}_{i}"
-                        )
-                        real_monthly = col2.number_input(
-                            "Πραγμ. δόση (€)", 0.0, 1e9, float(d.get("predicted_monthly") or 0.0),
-                            step=10.0, key=f"rm_{open_id}_{i}"
-                        )
-                        real_write   = col3.number_input(
-                            "Διαγραφή (€)", 0.0, float(d.get("balance",0) or 0.0), 0.0,
-                            step=100.0, key=f"rw_{open_id}_{i}"
-                        )
-                        real_resid   = max(0.0, float(d.get("balance",0) or 0.0) - float(real_write or 0.0))
-                        col4.metric("Υπόλοιπο ρύθμισης (€)", f"{real_resid:,.2f}")
+    # Φόρμα πραγματικής ρύθμισης ανά οφειλή + συγκριτικός πίνακας
+    real_list = []
+    comp_rows = []
+    st.markdown("### Πραγματική ρύθμιση ανά οφειλή & Σύγκριση με πρόβλεψη")
 
-                        haircut_pct = 0.0
-                        if float(d.get("balance",0) or 0.0) > 0:
-                            haircut_pct = 100.0 * (float(real_write or 0.0) / float(d.get("balance") or 1.0))
-                        st.caption(f"Ποσοστό κουρέματος: **{haircut_pct:.1f}%**")
+    for i, d in enumerate(predicted_debts):
+        with st.expander(f"Οφειλή #{i+1} – {d.get('creditor','')} / {d.get('loan_type','')} / Υπόλοιπο: {float(d.get('balance',0)):,.2f} €"):
+            col1,col2,col3,col4,col5 = st.columns(5)
+            real_term    = col1.number_input("Πραγμ. μήνες",   0, 1200, value= int(d.get("term_cap",0) or 0), key=f"rt_{open_id}_{i}")
+            real_monthly = col2.number_input("Πραγμ. δόση (€)", 0.0, 1e9, value= float(d.get("predicted_monthly",0) or 0.0), step=10.0, key=f"rm_{open_id}_{i}")
+            real_write   = col3.number_input("Διαγραφή (€)",    0.0, float(d.get("balance",0) or 0.0), value= float(d.get("predicted_writeoff",0) or 0.0), step=100.0, key=f"rw_{open_id}_{i}")
+            real_resid   = max(0.0, float(d.get("balance",0) or 0.0) - float(real_write or 0.0))
+            col4.metric("Υπόλοιπο ρύθμισης (€)", f"{real_resid:,.2f}")
+            haircut_pct  = 0.0 if (float(d.get("balance",0) or 0.0) <= 0) else 100.0 * (float(real_write or 0.0) / float(d.get("balance") or 1.0))
+            col5.metric("Κούρεμα (%)", f"{haircut_pct:.1f}%")
 
-                        real_list.append({
-                            "creditor": d.get("creditor",""),
-                            "loan_type": d.get("loan_type",""),
-                            "balance": float(d.get("balance",0) or 0.0),
-                            "real_term_months": int(real_term) if real_term else None,
-                            "real_monthly": float(real_monthly) if real_monthly else None,
-                            "real_writeoff": float(real_write) if real_write else None,
-                            "real_residual": float(real_resid),
-                            "real_haircut_pct": float(haircut_pct)
-                        })
+            real_list.append({
+                "creditor": d.get("creditor",""),
+                "loan_type": d.get("loan_type",""),
+                "balance": float(d.get("balance",0) or 0.0),
+                "real_term_months": int(real_term) if real_term else None,
+                "real_monthly": float(real_monthly) if real_monthly else None,
+                "real_writeoff": float(real_write) if real_write else None,
+                "real_residual": float(real_resid),
+                "real_haircut_pct": float(haircut_pct)
+            })
 
-                # Αποθήκευση πραγματικών ρυθμίσεων + σύγκριση
-                if st.button("💾 Αποθήκευση πραγματικής ρύθμισης", type="primary", key=f"save_real_{open_id}"):
-                    try:
-                        # Ενημέρωση συγκεντρωτικών
-                        monthly_vals = [x.get("real_monthly") for x in real_list if x.get("real_monthly") is not None]
-                        real_monthly_avg = float(np.mean(monthly_vals)) if monthly_vals else None
+            # Συγκριτικά (Πρόβλεψη vs Πραγματικό)
+            comp_rows.append({
+                "Πιστωτής": d.get("creditor",""),
+                "Είδος": d.get("loan_type",""),
+                "Υπόλοιπο (€)": float(d.get("balance",0) or 0.0),
+                "ΠΡΟΒΛΕΨΗ - Μήνες": d.get("term_cap"),
+                "ΠΡΟΒΛΕΨΗ - Δόση (€)": d.get("predicted_monthly"),
+                "ΠΡΟΒΛΕΨΗ - Διαγραφή (€)": d.get("predicted_writeoff"),
+                "ΠΡΑΓΜΑΤΙΚΟ - Μήνες": real_term,
+                "ΠΡΑΓΜΑΤΙΚΟ - Δόση (€)": real_monthly,
+                "ΠΡΑΓΜΑΤΙΚΟ - Διαγραφή (€)": real_write,
+                "ΠΡΑΓΜΑΤΙΚΟ - Υπόλοιπο (€)": real_resid,
+                "ΠΡΑΓΜΑΤΙΚΟ - Κούρεμα (%)": haircut_pct
+            })
 
-                        total_bal = sum([x.get("balance",0.0) for x in real_list])
-                        total_write = sum([x.get("real_writeoff",0.0) or 0.0 for x in real_list])
-                        real_haircut_pct_total = (100.0*total_write/total_bal) if total_bal>0 else None
+    # Προεπισκόπηση συγκριτικού πίνακα
+    st.markdown("#### Σύγκριση Πρόβλεψης vs Πραγματικού")
+    if comp_rows:
+        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
 
-                        # Προετοιμασία row update
-                        row_update = row.copy()
-                        row_update["real_debts_json"]   = json.dumps(real_list, ensure_ascii=False)
-                        row_update["real_monthly"]      = real_monthly_avg
-                        row_update["real_haircut_pct"]  = real_haircut_pct_total
-
-                        # Αποθήκευση
-                        save_data(pd.DataFrame([row_update]))
-                        st.success("✅ Αποθηκεύτηκε η πραγματική ρύθμιση για την υπόθεση.")
-
-                        # Προβολή γρήγορης σύγκρισης (forecast vs real)
-                        st.markdown("---")
-                        st.subheader("Σύγκριση πρόβλεψης vs πραγματικής ρύθμισης")
-                        comp_rows = []
-                        for d, r in zip(debts, real_list):
-                            comp_rows.append({
-                                "Πιστωτής": d.get("creditor",""),
-                                "Είδος": d.get("loan_type",""),
-                                "Πρόβλεψη δόσης (€)": d.get("predicted_monthly"),
-                                "Πραγμ. δόση (€)": r.get("real_monthly"),
-                                "Πρόβλεψη διαγραφής (€)": d.get("predicted_writeoff"),
-                                "Πραγμ. διαγραφή (€)": r.get("real_writeoff"),
-                                "Πρόβλεψη υπολοίπου (€)": d.get("predicted_residual"),
-                                "Πραγμ. υπόλοιπο (€)": r.get("real_residual"),
-                                "Πρόβλεψη κούρεμα (%)": d.get("predicted_haircut_pct"),
-                                "Πραγμ. κούρεμα (%)": r.get("real_haircut_pct"),
-                            })
-                        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Αποτυχία αποθήκευσης: {e}")
-
-        else:
-            st.info("Πάτησε **Άνοιγμα** σε κάποια υπόθεση από τη λίστα για να καταχωρήσεις την πραγματική ρύθμιση.")
+    # Save actual settlement
+    if st.button("💾 Αποθήκευση πραγματικής ρύθμισης", type="primary", key=f"save_real_{open_id}"):
+        row_update = row.copy()
+        row_update["real_debts_json"] = json.dumps(real_list, ensure_ascii=False)
+        try:
+            monthly_vals = [x.get("real_monthly") for x in real_list if x.get("real_monthly") is not None]
+            row_update["real_monthly"] = float(np.mean(monthly_vals)) if monthly_vals else None
+            total_bal = sum([x.get("balance",0.0) for x in real_list])
+            total_write = sum([x.get("real_writeoff",0.0) or 0.0 for x in real_list])
+            row_update["real_haircut_pct"] = (100.0*total_write/total_bal) if total_bal>0 else None
+        except Exception:
+            pass
+        save_data(pd.DataFrame([row_update]))
+        st.success("✅ Αποθηκεύτηκε η πραγματική ρύθμιση για την υπόθεση.")
