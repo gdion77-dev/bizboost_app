@@ -285,7 +285,7 @@ def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 def make_comparison_df(pred_debts, real_debts):
     """Return a DataFrame comparing forecast vs real per debt."""
-def key_of(d):
+    def key_of(d):
         return (
             str(d.get("creditor", "")).strip(),
             str(d.get("loan_type", "")).strip(),
