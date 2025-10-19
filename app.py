@@ -544,6 +544,18 @@ else:
 
 page = st.sidebar.radio("Μενού", ["Νέα Πρόβλεψη", "Προβλέψεις & Πραγματικές Ρυθμίσεις"], index=0)
 df_all = load_data()
+# Υποστήριξη απευθείας ανοίγματος με URL (?view=case&case_id=...)
+try:
+    qp = st.query_params          # Streamlit >= 1.30
+    view = qp.get("view")
+    cid_q = qp.get("case_id")
+except Exception:
+    qp = st.experimental_get_query_params()
+    view = (qp.get("view", [None]) or [None])[0]
+    cid_q = (qp.get("case_id", [None]) or [None])[0]
+
+if view == "case" and cid_q:
+    st.session_state["open_case_id"] = cid_q
 
 # Direct open via URL (?case_id=...)
 try:
@@ -747,9 +759,16 @@ else:
                 st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc['predicted_at'] or '—'}")
                 c1, c2 = st.columns([1,1])
                 with c1:
-                    if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
-                        st.session_state.open_case_id = cid
-                        st.rerun()
+    if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
+        # (1) γράψε state
+        st.session_state["open_case_id"] = cid
+        # (2) βάλε query params για άνοιγμα λεπτομέρειας
+        try:
+            st.query_params.update({"view": "case", "case_id": cid})
+        except Exception:
+            st.experimental_set_query_params(view="case", case_id=cid)
+        # (3) rerun
+        st.rerun()
                 with c2:
                     st.markdown(f"[↗︎ Νέο παράθυρο](?view=case&case_id={cid})")
                 if st.button("🗑️ Διαγραφή", key=f"del_{cid}", use_container_width=True):
