@@ -556,6 +556,18 @@ except Exception:
 
 if view == "case" and cid_q:
     st.session_state["open_case_id"] = cid_q
+# Υποστήριξη απευθείας ανοίγματος με URL (?view=case&case_id=...)
+try:
+    qp = st.query_params          # Streamlit >= 1.30
+    view = qp.get("view")
+    cid_q = qp.get("case_id")
+except Exception:
+    qp = st.experimental_get_query_params()
+    view = (qp.get("view", [None]) or [None])[0]
+    cid_q = (qp.get("case_id", [None]) or [None])[0]
+
+if view == "case" and cid_q:
+    st.session_state["open_case_id"] = cid_q
 
 # Direct open via URL (?case_id=...)
 try:
@@ -745,38 +757,56 @@ else:
     if df_all.empty:
         st.info("Δεν υπάρχουν ακόμα υποθέσεις."); st.stop()
 
-    # Κάρτες υποθέσεων
-    dfv = df_all[["case_id","borrower","predicted_at"]].fillna("").sort_values("predicted_at", ascending=False)
-    st.markdown("#### Αποθηκευμένες υποθέσεις")
-    cols_per_row = 3
-    rows = [dfv.iloc[i:i+cols_per_row] for i in range(0, len(dfv), cols_per_row)]
-    for chunk in rows:
-        cc = st.columns(len(chunk))
-        for idx, (_, rowc) in enumerate(chunk.iterrows()):
-            with cc[idx]:
-                cid = rowc["case_id"]
-                st.markdown(f"**{rowc['borrower'] or '—'}**")
-                st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc['predicted_at'] or '—'}")
-                c1, c2 = st.columns([1,1])
-                with c1:
-    if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
-        # (1) γράψε state
-        st.session_state["open_case_id"] = cid
-        # (2) βάλε query params για άνοιγμα λεπτομέρειας
-        try:
-            st.query_params.update({"view": "case", "case_id": cid})
-        except Exception:
-            st.experimental_set_query_params(view="case", case_id=cid)
-        # (3) rerun
-        st.rerun()
-                with c2:
-                    st.markdown(f"[↗︎ Νέο παράθυρο](?view=case&case_id={cid})")
-                if st.button("🗑️ Διαγραφή", key=f"del_{cid}", use_container_width=True):
-                    delete_case_db(cid)
-                    if st.session_state.open_case_id == cid:
-                        st.session_state.open_case_id = None
+    # ---------------------- ΚΑΡΤΕΣ ΥΠΟΘΕΣΕΩΝ ----------------------
+dfv = df_all.copy()
+dfv["predicted_at"] = dfv["predicted_at"].fillna("")
+dfv = dfv[["case_id","borrower","predicted_at"]].sort_values("predicted_at", ascending=False)
+
+st.markdown("#### Αποθηκευμένες υποθέσεις")
+cols_per_row = 3
+for row_start in range(0, len(dfv), cols_per_row):
+    row_chunk = dfv.iloc[row_start:row_start+cols_per_row]
+    cols = st.columns(len(row_chunk))
+    for col_idx, (_, rowc) in enumerate(row_chunk.iterrows()):
+        with cols[col_idx]:
+            cid = rowc["case_id"]
+            st.markdown(f"**{rowc['borrower'] or '—'}**")
+            st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc['predicted_at'] or '—'}")
+
+            c1, c2 = st.columns(2)
+
+            # --- Άνοιγμα στην ίδια σελίδα ---
+            with c1:
+                if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
+                    # (1) γράψε state
+                    st.session_state["open_case_id"] = cid
+                    # (2) βάλε query params για να μπει σε mode λεπτομέρειας
+                    try:
+                        st.query_params.update({"view": "case", "case_id": cid})
+                    except Exception:
+                        st.experimental_set_query_params(view="case", case_id=cid)
+                    # (3) rerun
+                    st.rerun()
+
+            # --- Άνοιγμα σε νέο tab ---
+            with c2:
+                st.markdown(
+                    f"[↗︎ Νέο παράθυρο](" f"?view=case&case_id={cid}" f")",
+                    help="Άνοιγμα λεπτομερειών υπόθεσης σε νέο tab",
+                )
+
+            # --- Διαγραφή ---
+            if st.button("🗑️ Διαγραφή", key=f"del_{cid}", use_container_width=True):
+                try:
+                    engine = get_db_engine()
+                    with engine.begin() as conn:
+                        conn.execute(text("DELETE FROM cases WHERE case_id=:cid"), {"cid": cid})
+                    if st.session_state.get("open_case_id") == cid:
+                        st.session_state["open_case_id"] = None
                     st.success(f"Διαγράφηκε η υπόθεση {cid}")
                     st.rerun()
+                except Exception as e:
+                    st.error(f"Αποτυχία διαγραφής: {e}")
 
     st.markdown("---")
 
