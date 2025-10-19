@@ -852,27 +852,67 @@ if page == "Νέα Πρόβλεψη":
 
 # ─────────────────────── ΠΡΟΒΛΕΨΕΙΣ & ΠΡΑΓΜΑΤΙΚΕΣ ΡΥΘΜΙΣΕΙΣ ───────────────────────
 else:
-    st.title("📁 Προβλέψεις & Πραγματικές Ρυθμίσεις")
+    # Αν έχει οριστεί open_case_id (είτε από το κουμπί Άνοιγμα είτε από query param),
+    # δείχνουμε ΜΟΝΟ τη σελίδα λεπτομερειών με Back.
+    open_id = st.session_state.open_case_id
 
+    # Υποστήριξη query params (?view=case&case_id=...)
+    try:
+        qp = st.query_params
+        qp_view = qp.get("view", None)
+        qp_case = qp.get("case_id", None)
+    except Exception:
+        qp = st.experimental_get_query_params()
+        qp_view = (qp.get("view", [None]) or [None])[0]
+        qp_case = (qp.get("case_id", [None]) or [None])[0]
+
+    if qp_view == "case" and qp_case:
+        open_id = qp_case
+        st.session_state.open_case_id = qp_case
+
+    # Φόρτωση δεδομένων
     if df_all.empty:
+        st.title("📁 Προβλέψεις & Πραγματικές Ρυθμίσεις")
         st.info("Δεν υπάρχουν ακόμα υποθέσεις.")
         st.stop()
 
-    # Κάρτες υποθέσεων
+    # Αν υπάρχει ήδη ανοιχτή υπόθεση → δείξε ΜΟΝΟ τα details και ένα Back
+    if open_id:
+        # Back/Cancel πάνω αριστερά
+        cols_hdr = st.columns([1, 3, 1])
+        with cols_hdr[0]:
+            if st.button("← Πίσω στις υποθέσεις", use_container_width=True, key="back_to_cases"):
+                st.session_state.open_case_id = None
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.rerun()
+
+        with cols_hdr[1]:
+            st.title("📄 Λεπτομέρειες Υπόθεσης")
+
+        show_case_detail(df_all, open_id)
+        st.stop()
+
+    # Αλλιώς (ΔΕΝ υπάρχει open_case_id) → δείξε τις αποθηκευμένες υποθέσεις σε κάρτες
+    st.title("📁 Προβλέψεις & Πραγματικές Ρυθμίσεις")
+
     dfv = df_all.copy()
     dfv["predicted_at"] = dfv["predicted_at"].fillna("")
     dfv = dfv[["case_id","borrower","predicted_at"]].sort_values("predicted_at", ascending=False)
 
     st.markdown("#### Αποθηκευμένες υποθέσεις")
+
     cols_per_row = 3
     rows = [dfv.iloc[i:i+cols_per_row] for i in range(0, len(dfv), cols_per_row)]
     for chunk in rows:
         cc = st.columns(len(chunk))
-        for idx, (_, rowc) in enumerate(chunk.iterrows()):
-            with cc[idx]:
-                cid = rowc["case_id"]
-                st.markdown(f"**{rowc['borrower'] or '—'}**")
-                st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc['predicted_at'] or '—'}")
+        for _, rowc in zip(range(len(chunk)), chunk.itertuples(index=False)):
+            with cc[_]:
+                cid = rowc.case_id
+                st.markdown(f"**{rowc.borrower or '—'}**")
+                st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc.predicted_at or '—'}")
                 c1, c2 = st.columns([1,1])
                 with c1:
                     if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
@@ -880,6 +920,8 @@ else:
                         st.rerun()
                 with c2:
                     st.markdown(f"[↗︎ Νέο παράθυρο](?view=case&case_id={cid})", help="Άνοιγμα σε νέο tab")
+
+                # Διαγραφή
                 if st.button("🗑️ Διαγραφή", key=f"del_{cid}", use_container_width=True):
                     try:
                         delete_case_db(cid)
@@ -889,13 +931,5 @@ else:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Αποτυχία διαγραφής: {e}")
+
                 st.markdown("&nbsp;")
-
-    st.markdown("---")
-
-    # Αν έχεις επιλέξει υπόθεση, δείξε τη σε αυτή τη σελίδα
-    open_id = st.session_state.open_case_id
-    if open_id:
-        show_case_detail(df_all, open_id)
-    else:
-        st.info("Πάτησε **Άνοιγμα** σε κάποια υπόθεση για να δεις/καταχωρήσεις την πραγματική ρύθμιση και τη σύγκριση.")
