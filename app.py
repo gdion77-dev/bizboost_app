@@ -1,13 +1,11 @@
 # app.py
 # Bizboost - Εξωδικαστικός: Πρόβλεψη & Καταγραφή Ρυθμίσεων (Streamlit + Postgres + PDF)
 # - Ελληνικό UI
-# - Supabase Postgres μέσω SQLAlchemy + psycopg v3
+# - Postgres μέσω SQLAlchemy + psycopg v3
 # - PDF (ReportLab) με σωστά Ελληνικά, λογότυπο/label & πίνακες
-# - Συνοφειλέτες: annual_income (ετήσιο) -> monthly, αφαίρεση ΕΔΔ ανά συνοφειλέτη
-# - Κανόνες εξωδικαστικού: ΑΑΔΕ/ΕΦΚΑ 240μήνες, Τράπεζες/Servicers 420μήνες, κόφτης ηλικίας
-# - Κατανομή διαθέσιμου: Δημόσιο -> Εξασφαλισμένα -> Λοιπά (priority)
-# - Αποθήκευση πρόβλεψης + καταχώριση πραγματικών ρυθμίσεων ανά οφειλή
-# - Προβολή λεπτομερειών υπόθεσης σε ξεχωριστή σελίδα (με ?case_id=...), σύγκριση Πρόβλεψης vs Πραγματικής
+# - Πρόβλεψη, αποθήκευση, πραγματικές ρυθμίσεις ανά οφειλή & σύγκριση
+# - Προβολή υπόθεσης σε νέο παράθυρο (?view=case&case_id=...), κουμπί Back
+# - Κάρτες αποθηκευμένων υποθέσεων με Άνοιγμα / Νέο Παράθυρο / Διαγραφή
 
 import os, io, json, uuid, datetime as dt
 import numpy as np
@@ -33,9 +31,9 @@ if "open_case_id" not in st.session_state:
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
-DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")
+DATA_CSV  = os.path.join(BASE_DIR, "cases.csv")  # προαιρετικό αρχικό import
 
-# ───────── Γραμματοσειρές για σωστά Ελληνικά στο PDF ─────────
+# ───────── Γραμματοσειρές για σωστά Ελληνικά στο PDF (NotoSans → NotoSerif → fallback) ─────────
 FONT_DIR = os.path.join(BASE_DIR, "assets", "fonts")
 FONT_CANDIDATES = [
     ("NotoSans",  os.path.join(FONT_DIR, "NotoSans-Regular.ttf")),
@@ -53,10 +51,9 @@ try:
                 break
         except Exception:
             continue
-    if chosen:
-        PDF_FONT = chosen
-    else:
-        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica (ίσως λάθος ελληνικά στο PDF).")
+    PDF_FONT = chosen or "Helvetica"
+    if not chosen:
+        st.warning("Δεν βρέθηκε έγκυρο TTF (NotoSans/NotoSerif) στο assets/fonts. Θα χρησιμοποιηθεί Helvetica.")
 except Exception as e:
     st.warning(f"Αποτυχία φόρτωσης γραμματοσειράς PDF: {e}")
     PDF_FONT = "Helvetica"
@@ -71,9 +68,9 @@ CREDITORS = list(PUBLIC_CREDITORS) + list(BANK_SERVICERS)
 LOAN_TYPES = ["Στεγαστικό","Καταναλωτικό","Επαγγελματικό"]
 
 POLICY = {
-    "priority": ["PUBLIC", "SECURED", "UNSECURED"],
+    "priority": ["PUBLIC", "SECURED", "UNSECURED"],  # σειρά εξυπηρέτησης
     "term_caps": {"PUBLIC": 240, "BANK": 420, "DEFAULT": 240},
-    "allocate": "priority_first",  # ή "proportional"
+    "allocate": "priority_first",  # "priority_first" ή "proportional"
     "max_haircut": {"PUBLIC": None, "BANK": None, "DEFAULT": None},
 }
 
@@ -87,7 +84,8 @@ def compute_edd(adults:int, children:int)->float:
     per_child  = 211
     if adults <= 0:
         adults = 1
-    return float(base_adult + max(adults-1,0)*add_adult + children*per_child)
+    total = base_adult + max(adults-1,0)*add_adult + children*per_child
+    return float(total)
 
 def months_cap_from_age(age:int)->int:
     try:
@@ -116,6 +114,7 @@ def term_cap_for(creditor:str, age_cap:int, secured:bool)->int:
     return max(1, min(base, age_cap))
 
 def security_floor(balance:float, secured:bool, collateral_value:float)->float:
+    """Κατώφλι λόγω εξασφάλισης: δεν διαγράφεις κάτω από (balance - collateral)."""
     if not secured:
         return 0.0
     return max(0.0, float(balance or 0.0) - float(collateral_value or 0.0))
@@ -126,6 +125,7 @@ def split_available_proportional(avail:float, debts:list)->dict:
     return {i: avail * (d["balance"]/total) for i,d in enumerate(debts)}
 
 def split_available_priority(avail:float, debts:list)->dict:
+    """Πρώτα PUBLIC (αναλογικά μεταξύ τους), μετά SECURED, μετά UNSECURED."""
     out = {i:0.0 for i in range(len(debts))}
     groups = {"PUBLIC":[], "SECURED":[], "UNSECURED":[]}
     for i,d in enumerate(debts):
@@ -184,7 +184,8 @@ def get_db_engine():
         st.stop()
     if db_url.startswith("postgresql://"):
         db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
-    return create_engine(db_url, pool_pre_ping=True)
+    engine = create_engine(db_url, pool_pre_ping=True)
+    return engine
 
 def init_db(engine):
     ddl = """
@@ -290,7 +291,7 @@ def load_data():
 def save_data(df: pd.DataFrame):
     upsert_cases_db(df)
 
-# ───────── Ασφαλείς helpers format & JSON ─────────
+# ───────── Safe format helpers ─────────
 def _to_float(x, default=0.0):
     try:
         if x is None:
@@ -311,14 +312,17 @@ def pct1(x) -> str:
 def s(x) -> str:
     return "" if x is None else str(x)
 
-def parse_json_maybe(v):
-    """Δέχεται είτε list/dict είτε JSON string· επιστρέφει πάντα list/dict."""
-    if isinstance(v, (list, dict)):
-        return v
-    try:
-        return json.loads(v) if (isinstance(v, str) and v.strip()) else []
-    except Exception:
-        return []
+def render_kv_grid(pairs, cols=2):
+    """Εμφανίζει ζεύγη (label, value) σε πλέγμα 2+ στηλών."""
+    if not pairs:
+        return
+    for i in range(0, len(pairs), cols):
+        row_pairs = pairs[i:i+cols]
+        columns = st.columns(len(row_pairs))
+        for col, (label, value) in zip(columns, row_pairs):
+            with col:
+                st.markdown(f"**{label}**")
+                st.markdown(f"{value}")
 
 # ────────────────────────────── PDF EXPORT (ΒΕΛΤΙΩΜΕΝΟ LAYOUT) ──────────────────────────────
 def make_pdf(case_dict:dict)->bytes:
@@ -378,7 +382,7 @@ def make_pdf(case_dict:dict)->bytes:
     # Λογότυπο/label
     if os.path.exists(LOGO_PATH):
         try:
-            img = Image(LOGO_PATH, width=150)  # ασφαλές max πλάτος
+            img = Image(LOGO_PATH, width=150)
             img.hAlign = 'CENTER'
             story.append(img)
             story.append(Spacer(1, 6))
@@ -497,48 +501,84 @@ def show_case_detail(df_all: pd.DataFrame, case_id: str):
         return
     row = rowdf.iloc[0].to_dict()
 
-    debts = parse_json_maybe(row.get("debts_json"))
-    real_debts = parse_json_maybe(row.get("real_debts_json"))
+    # parse saved JSON
+    try:
+        debts = json.loads(row.get("debts_json") or "[]")
+    except Exception:
+        debts = []
+    try:
+        real_debts = json.loads(row.get("real_debts_json") or "[]")
+    except Exception:
+        real_debts = []
 
-    st.title(f"📄 Υπόθεση {case_id}")
-    st.caption(f"Οφειλέτης: **{row.get('borrower','')}** — Πρόβλεψη: {row.get('predicted_at','')}")
+    # Header με Back
+    topc1, topc2 = st.columns([1,3])
+    with topc1:
+        if st.button("← Πίσω στις υποθέσεις", use_container_width=True):
+            st.session_state.open_case_id = None
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
+    with topc2:
+        st.title(f"📄 Υπόθεση {case_id}")
 
-    # Πίνακας πρόβλεψης
+    # Περίληψη 2 στήλες
+    st.markdown("### Περίληψη")
+    summary_pairs = [
+        ("Οφειλέτης", row.get("borrower","—")),
+        ("Ημερ. πρόβλεψης", row.get("predicted_at","—")),
+        ("Ηλικία οφειλέτη", str(row.get("debtor_age","—"))),
+        ("Νοικοκυριό (ενήλικες/ανήλικοι)", f"{int(row.get('adults') or 0)}/{int(row.get('children') or 0)}"),
+        ("Μηνιαίο εισόδημα (σύνολο)", eur(row.get("monthly_income"))),
+        ("Ακίνητη περιουσία", eur(row.get("property_value"))),
+    ]
+    render_kv_grid(summary_pairs, cols=2)
+    st.markdown("---")
+
+    # Πρόβλεψη ανά οφειλή
     if debts:
-        df_pred = pd.DataFrame(debts)
         st.subheader("Πρόβλεψη ανά οφειλή")
+        df_pred = pd.DataFrame(debts)
         st.dataframe(df_pred, use_container_width=True, hide_index=True)
     else:
         st.info("Δεν υπάρχουν οφειλές καταχωρημένες στην πρόβλεψη.")
 
-    # Φόρμα Πραγματικής Ρύθμισης
+    # Φόρμα Πραγματικής Ρύθμισης (2 στήλες expanders)
     st.subheader("Καταχώριση Πραγματικής Ρύθμισης")
     real_list = []
-    for i, d in enumerate(debts):
-        with st.expander(f"Οφειλή #{i+1} – {d.get('creditor','')} / {d.get('loan_type','')} / Υπόλοιπο: {eur_num(d.get('balance'))} €", expanded=False):
-            # Προσυμπλήρωση
-            pre = None
-            for r in (real_debts or []):
-                if r.get("creditor")==d.get("creditor") and r.get("loan_type")==d.get("loan_type") and _to_float(r.get("balance"))==_to_float(d.get("balance")):
-                    pre = r; break
-            col1,col2,col3,col4 = st.columns(4)
-            real_term    = col1.number_input("Πραγμ. μήνες", 0, 1200, int((pre or {}).get("real_term_months") or 0), key=f"rt_{case_id}_{i}")
-            real_monthly = col2.number_input("Πραγμ. δόση (€)", 0.0, 1e9, float((pre or {}).get("real_monthly") or 0.0), step=10.0, key=f"rm_{case_id}_{i}")
-            real_write   = col3.number_input("Διαγραφή (€)", 0.0, _to_float(d.get("balance")), float((pre or {}).get("real_writeoff") or 0.0), step=100.0, key=f"rw_{case_id}_{i}")
-            real_resid   = max(0.0, _to_float(d.get("balance")) - _to_float(real_write))
-            col4.metric("Υπόλοιπο ρύθμισης (€)", f"{eur_num(real_resid)}")
-            haircut_pct = 0.0 if _to_float(d.get("balance"))<=0 else 100.0*(_to_float(real_write)/max(1.0,_to_float(d.get("balance"))))
-            st.caption(f"Ποσοστό κουρέματος: **{haircut_pct:.1f}%**")
-            real_list.append({
-                "creditor": d.get("creditor",""),
-                "loan_type": d.get("loan_type",""),
-                "balance": _to_float(d.get("balance")),
-                "real_term_months": int(real_term) if real_term else None,
-                "real_monthly": _to_float(real_monthly) if real_monthly else None,
-                "real_writeoff": _to_float(real_write) if real_write else None,
-                "real_residual": _to_float(real_resid),
-                "real_haircut_pct": float(haircut_pct)
-            })
+    if debts:
+        left_col, right_col = st.columns(2)
+        for i, d in enumerate(debts):
+            target_col = left_col if i % 2 == 0 else right_col
+            with target_col.expander(
+                f"Οφειλή #{i+1} – {d.get('creditor','')} / {d.get('loan_type','')} / Υπόλοιπο: {eur_num(d.get('balance'))} €",
+                expanded=False
+            ):
+                # Προσυμπλήρωση
+                pre = None
+                for r in (real_debts or []):
+                    if r.get("creditor")==d.get("creditor") and r.get("loan_type")==d.get("loan_type") and _to_float(r.get("balance"))==_to_float(d.get("balance")):
+                        pre = r; break
+                c1,c2,c3,c4 = st.columns(4)
+                real_term    = c1.number_input("Πραγμ. μήνες", 0, 1200, int((pre or {}).get("real_term_months") or 0), key=f"rt_{case_id}_{i}")
+                real_monthly = c2.number_input("Πραγμ. δόση (€)", 0.0, 1e9, float((pre or {}).get("real_monthly") or 0.0), step=10.0, key=f"rm_{case_id}_{i}")
+                real_write   = c3.number_input("Διαγραφή (€)", 0.0, _to_float(d.get("balance")), float((pre or {}).get("real_writeoff") or 0.0), step=100.0, key=f"rw_{case_id}_{i}")
+                real_resid   = max(0.0, _to_float(d.get("balance")) - _to_float(real_write))
+                c4.metric("Υπόλοιπο ρύθμισης (€)", f"{eur_num(real_resid)}")
+                haircut_pct = 0.0 if _to_float(d.get("balance"))<=0 else 100.0*(_to_float(real_write)/max(1.0,_to_float(d.get("balance"))))
+                st.caption(f"Ποσοστό κουρέματος: **{haircut_pct:.1f}%**")
+                real_list.append({
+                    "creditor": d.get("creditor",""),
+                    "loan_type": d.get("loan_type",""),
+                    "balance": _to_float(d.get("balance")),
+                    "real_term_months": int(real_term) if real_term else None,
+                    "real_monthly": _to_float(real_monthly) if real_monthly else None,
+                    "real_writeoff": _to_float(real_write) if real_write else None,
+                    "real_residual": _to_float(real_resid),
+                    "real_haircut_pct": float(haircut_pct)
+                })
 
     # Αποθήκευση πραγματικής ρύθμισης
     if debts and st.button("💾 Αποθήκευση πραγματικής ρύθμισης", type="primary", key=f"save_real_{case_id}"):
@@ -553,36 +593,42 @@ def show_case_detail(df_all: pd.DataFrame, case_id: str):
         except Exception:
             pass
         save_data(pd.DataFrame([row_update]))
-        st.success("✅ Αποθηκεύτηκε η πραγματική ρύθμιση. Γίνεται ανανέωση...")
+        st.success("✅ Αποθηκεύτηκε η πραγματική ρύθμιση για την υπόθεση.")
         st.rerun()
 
-    # Σύγκριση (από DB αν υπάρχει)
-    real_debts_saved = parse_json_maybe(row.get("real_debts_json"))
-    if debts and real_debts_saved:
-        st.subheader("Σύγκριση Πρόβλεψης vs Πραγματικής Ρύθμισης")
+    # Σύγκριση (αν υπάρχουν αποθηκευμένες πραγματικές)
+    try:
+        real_debts_saved = json.loads(row.get("real_debts_json") or "[]")
+    except Exception:
+        real_debts_saved = []
+
+    if real_debts_saved:
+        st.markdown("### Σύγκριση Πρόβλεψης vs Πραγματικής Ρύθμισης")
+
         def key_of(x):
-            return f"{x.get('creditor','')}|{x.get('loan_type','')}|{round(_to_float(x.get('balance')),2)}"
-        pred_map = {key_of(d): d for d in debts}
+            return f"{x.get('creditor','')}|{x.get('loan_type','')}|{round(float(x.get('balance',0) or 0.0),2)}"
+
+        pred_map = { key_of(p): p for p in (debts or []) }
         rows_cmp = []
         for r in real_debts_saved:
             k = key_of(r)
-            d = pred_map.get(k, {})
+            p = pred_map.get(k, {})
             rows_cmp.append({
                 "Πιστωτής": r.get("creditor",""),
                 "Είδος": r.get("loan_type",""),
                 "Υπόλοιπο (€)": eur_num(r.get("balance")),
-                "Πρόβλ. Δόση (€)": eur_num(d.get("predicted_monthly")),
+                "Πρόβλ. Δόση (€)": eur_num(p.get("predicted_monthly")),
                 "Πραγμ. Δόση (€)": eur_num(r.get("real_monthly")),
-                "Διαφορά Δόσης (€)": eur_num(_to_float(r.get("real_monthly")) - _to_float(d.get("predicted_monthly"))),
-                "Πρόβλ. Διαγραφή (€)": eur_num(d.get("predicted_writeoff")),
+                "Διαφορά Δόσης (€)": eur_num(_to_float(r.get("real_monthly")) - _to_float(p.get("predicted_monthly"))),
+                "Πρόβλ. Διαγραφή (€)": eur_num(p.get("predicted_writeoff")),
                 "Πραγμ. Διαγραφή (€)": eur_num(r.get("real_writeoff")),
-                "Διαφορά Διαγραφής (€)": eur_num(_to_float(r.get("real_writeoff")) - _to_float(d.get("predicted_writeoff"))),
-                "Πρόβλ. Υπόλ. (€)": eur_num(d.get("predicted_residual")),
-                "Πραγμ. Υπόλ. (€)": eur_num(r.get("real_residual")),
-                "Διαφορά Υπολοίπου (€)": eur_num(_to_float(r.get("real_residual")) - _to_float(d.get("predicted_residual"))),
+                "Διαφορά Διαγραφής (€)": eur_num(_to_float(r.get("real_writeoff")) - _to_float(p.get("predicted_writeoff"))),
+                "Πρόβλ. Υπόλοιπο (€)": eur_num(p.get("predicted_residual")),
+                "Πραγμ. Υπόλοιπο (€)": eur_num(r.get("real_residual")),
+                "Διαφορά Υπολοίπου (€)": eur_num(_to_float(r.get("real_residual")) - _to_float(p.get("predicted_residual"))),
             })
-        st.dataframe(pd.DataFrame(rows_cmp), use_container_width=True)
-    elif debts:
+        st.dataframe(pd.DataFrame(rows_cmp), use_container_width=True, hide_index=True)
+    else:
         st.info("Δεν έχει αποθηκευτεί ακόμα πραγματική ρύθμιση για αυτή την υπόθεση.")
 
 # ────────────────────────────── UI ──────────────────────────────
@@ -595,15 +641,16 @@ else:
 page = st.sidebar.radio("Μενού", ["Νέα Πρόβλεψη", "Προβλέψεις & Πραγματικές Ρυθμίσεις"], index=0)
 df_all = load_data()
 
-# Direct open via URL query param (?view=case&case_id=...)
+# ─── Direct open via URL query param (?view=case&case_id=...) ───
 try:
-    qp = st.query_params  # Streamlit >= 1.30
+    qp = st.query_params     # Streamlit >= 1.30
     qp_view = qp.get("view", None)
     qp_case = qp.get("case_id", None)
 except Exception:
     qp = st.experimental_get_query_params()
     qp_view = (qp.get("view", [None]) or [None])[0]
     qp_case = (qp.get("case_id", [None]) or [None])[0]
+
 if qp_view == "case" and qp_case:
     st.session_state.open_case_id = qp_case
 
@@ -683,17 +730,19 @@ if page == "Νέα Πρόβλεψη":
         edd_codes = 0.0
         for c in codebtors:
             monthly_income_codes += float(c.get("annual_income") or 0.0)/12.0
-            edd_codes += compute_edd(int(c.get("adults") or 1), int(c.get("children") or 0))
+            cadults = int(c.get("adults") or 1)
+            cchildren = int(c.get("children") or 0)
+            edd_codes += compute_edd(cadults, cchildren)
 
         monthly_income = float(monthly_income_main + monthly_income_codes)
         edd_total_house = float(edd_val + edd_codes)
 
-        # Οφειλές
         debts = debts_df.fillna(0).to_dict(orient="records")
         extras_sum = (extra_medical or 0) + (extra_students or 0) + (extra_legal or 0)
         avail = available_income(monthly_income, edd_total_house, extra_medical, extra_students, extra_legal)
         age_cap_months = months_cap_from_age(int(debtor_age))
 
+        # Εμπλουτισμός & κατανομή
         enriched = []
         for d in debts:
             enriched.append({
@@ -704,7 +753,6 @@ if page == "Νέα Πρόβλεψη":
                 "collateral_value": float(d.get("collateral_value",0) or 0.0),
                 "cat": classify_debt(str(d.get("creditor","")).strip(), bool(d.get("secured"))),
             })
-
         shares = split_available_priority(avail, enriched) if POLICY["allocate"]=="priority_first" else split_available_proportional(avail, enriched)
 
         per_debt_rows = []
@@ -810,7 +858,7 @@ else:
         st.info("Δεν υπάρχουν ακόμα υποθέσεις.")
         st.stop()
 
-    # Cards grid
+    # Κάρτες υποθέσεων
     dfv = df_all.copy()
     dfv["predicted_at"] = dfv["predicted_at"].fillna("")
     dfv = dfv[["case_id","borrower","predicted_at"]].sort_values("predicted_at", ascending=False)
@@ -818,7 +866,6 @@ else:
     st.markdown("#### Αποθηκευμένες υποθέσεις")
     cols_per_row = 3
     rows = [dfv.iloc[i:i+cols_per_row] for i in range(0, len(dfv), cols_per_row)]
-
     for chunk in rows:
         cc = st.columns(len(chunk))
         for idx, (_, rowc) in enumerate(chunk.iterrows()):
@@ -826,31 +873,29 @@ else:
                 cid = rowc["case_id"]
                 st.markdown(f"**{rowc['borrower'] or '—'}**")
                 st.caption(f"Υπόθεση: `{cid}`  \nΗμερ.: {rowc['predicted_at'] or '—'}")
-                colA, colB = st.columns(2)
-                # Άμεσο άνοιγμα εδώ
-                if colA.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
-                    st.session_state.open_case_id = cid
-                    show_case_detail(df_all, cid)  # άμεση εμφάνιση
-                    st.stop()
-                # Νέο παράθυρο (deep link)
-                colB.markdown(f"[↗︎ Νέο παράθυρο](?view=case&case_id={cid})")
-                # Διαγραφή
+                c1, c2 = st.columns([1,1])
+                with c1:
+                    if st.button("📂 Άνοιγμα", key=f"open_{cid}", use_container_width=True):
+                        st.session_state.open_case_id = cid
+                        st.rerun()
+                with c2:
+                    st.markdown(f"[↗︎ Νέο παράθυρο](?view=case&case_id={cid})", help="Άνοιγμα σε νέο tab")
                 if st.button("🗑️ Διαγραφή", key=f"del_{cid}", use_container_width=True):
                     try:
                         delete_case_db(cid)
-                        if st.session_state.get("open_case_id") == cid:
+                        if st.session_state.open_case_id == cid:
                             st.session_state.open_case_id = None
                         st.success(f"Διαγράφηκε η υπόθεση {cid}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Αποτυχία διαγραφής: {e}")
+                st.markdown("&nbsp;")
 
     st.markdown("---")
 
-    # Αν δεν άνοιξες τώρα, αλλά έχεις ανοιχτή από πριν
-    open_id = st.session_state.get("open_case_id")
-    if not open_id:
-        st.info("Πάτησε **Άνοιγμα** σε κάποια υπόθεση για να καταχωρήσεις την πραγματική ρύθμιση και να δεις τη σύγκριση.")
-        st.stop()
-
-    show_case_detail(df_all, open_id)
+    # Αν έχεις επιλέξει υπόθεση, δείξε τη σε αυτή τη σελίδα
+    open_id = st.session_state.open_case_id
+    if open_id:
+        show_case_detail(df_all, open_id)
+    else:
+        st.info("Πάτησε **Άνοιγμα** σε κάποια υπόθεση για να δεις/καταχωρήσεις την πραγματική ρύθμιση και τη σύγκριση.")
