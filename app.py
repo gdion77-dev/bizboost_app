@@ -496,7 +496,10 @@ def set_query_params(**kwargs):
         st.experimental_set_query_params(**kwargs)
 
 # ────────────────────────────── UI ──────────────────────────────
-st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost") if os.path.exists(LOGO_PATH) else st.sidebar.markdown("**Bizboost**")
+if os.path.exists(LOGO_PATH):
+    st.sidebar.image(LOGO_PATH, width=170, caption="Bizboost")
+else:
+    st.sidebar.markdown("**Bizboost**")
 params = get_query_params()
 
 # Viewer Mode: ./?view=case&case_id=...
